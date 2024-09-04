@@ -1,7 +1,7 @@
 export MODEL_NAME="black-forest-labs/FLUX.1-dev"
 export INSTANCE_DIR="dog"
-export OUTPUT_DIR="trained-flux-lora"
-export CLASS_DIR="dog-prior"
+export OUTPUT_DIR="/root/autodl-tmp/flux-lora-dreambooth"
+export CLASS_DIR="/root/autodl-tmp/data/dog-prior"
 
 accelerate launch train_dreambooth_lora_flux.py \
   --pretrained_model_name_or_path=$MODEL_NAME  \
@@ -12,7 +12,7 @@ accelerate launch train_dreambooth_lora_flux.py \
   --with_prior_preservation --prior_loss_weight=1.0 \
   --prior_generation_precision "bf16" \
   --instance_prompt="A high-resolution photo of sks dog" \
-  --class_prompt="A high-resolution photo of a [dog breed]" \
+  --class_prompt="A high-resolution photo of a dog" \
   --resolution=1024 \
   --train_batch_size=1 \
   --gradient_accumulation_steps=4 \
@@ -25,4 +25,5 @@ accelerate launch train_dreambooth_lora_flux.py \
   --validation_epochs=30 \
   --num_class_images=200 \
   --seed="0" \
+  --rank=512
   --push_to_hub

@@ -1418,10 +1418,11 @@ def main(args):
                     hash_image = insecure_hashlib.sha1(image.tobytes()).hexdigest()
                     image_filename = class_images_dir / f"{example['index'][i] + cur_class_images}-{hash_image}.jpg"
                     image.save(image_filename)
+                    
+                if torch.cuda.is_available():
+                    torch.cuda.empty_cache()
 
             del pipeline
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
     # If custom instance prompts are NOT provided (i.e. the instance prompt is used for all images),
     # pack the statically computed variables appropriately here. This is so that we don't
