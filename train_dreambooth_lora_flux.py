@@ -1301,26 +1301,6 @@ def main(args):
             eps=args.adam_epsilon,
         )
 
-    # Dataset and DataLoaders creation:
-    train_dataset = DreamBoothDataset(
-        instance_data_root=args.instance_data_dir,
-        instance_prompt=args.instance_prompt,
-        class_prompt=args.class_prompt,
-        class_data_root=args.class_data_dir if args.with_prior_preservation else None,
-        class_num=args.num_class_images,
-        size=args.resolution,
-        repeats=args.repeats,
-        center_crop=args.center_crop,
-    )
-
-    train_dataloader = torch.utils.data.DataLoader(
-        train_dataset,
-        batch_size=args.train_batch_size,
-        shuffle=True,
-        collate_fn=lambda examples: collate_fn(examples, args.with_prior_preservation),
-        num_workers=args.dataloader_num_workers,
-    )
-
     if not args.train_text_encoder:
         tokenizers = [tokenizer_one, tokenizer_two]
         text_encoders = [text_encoder_one, text_encoder_two]
@@ -1334,38 +1314,15 @@ def main(args):
                 pooled_prompt_embeds = pooled_prompt_embeds.to(accelerator.device)
                 text_ids = text_ids.to(accelerator.device)
             return prompt_embeds, pooled_prompt_embeds, text_ids
-
-    # If no type of tuning is done on the text_encoder and custom instance prompts are NOT
-    # provided (i.e. the --instance_prompt is used for all images), we encode the instance prompt once to avoid
-    # the redundant encoding.
-    if not args.train_text_encoder and not train_dataset.custom_instance_prompts:
-        instance_prompt_hidden_states, instance_pooled_prompt_embeds, instance_text_ids = compute_text_embeddings(
-            args.instance_prompt, text_encoders, tokenizers
-        )
-
-        if args.validation_prompt is not None:
-            validation_prompt_hidden_states, validation_pooled_prompt_embeds, _ = compute_text_embeddings(
-                args.validation_prompt, text_encoders, tokenizers
-            )
-
+    
     # Handle class prompt for prior-preservation.
     if args.with_prior_preservation:
         if not args.train_text_encoder:
             class_prompt_hidden_states, class_pooled_prompt_embeds, class_text_ids = compute_text_embeddings(
                 args.class_prompt, text_encoders, tokenizers
             )
-
-    # Clear the memory here
-    if not args.train_text_encoder and not train_dataset.custom_instance_prompts:
-        del tokenizers, text_encoders
-        # Explicitly delete the objects as well, otherwise only the lists are deleted and the original references remain, preventing garbage collection
-        del text_encoder_one, text_encoder_two
-        gc.collect()
-        if torch.cuda.is_available():
-            torch.cuda.empty_cache()
-
-    # Generate class images if prior preservation is enabled.
-    if args.with_prior_preservation:
+            
+        # Generate class images if prior preservation is enabled.
         class_images_dir = Path(args.class_data_dir)
         if not class_images_dir.exists():
             class_images_dir.mkdir(parents=True)
@@ -1423,6 +1380,51 @@ def main(args):
                     torch.cuda.empty_cache()
 
             del pipeline
+<<<<<<< HEAD
+=======
+
+    # Dataset and DataLoaders creation:
+    train_dataset = DreamBoothDataset(
+        instance_data_root=args.instance_data_dir,
+        instance_prompt=args.instance_prompt,
+        class_prompt=args.class_prompt,
+        class_data_root=args.class_data_dir if args.with_prior_preservation else None,
+        class_num=args.num_class_images,
+        size=args.resolution,
+        repeats=args.repeats,
+        center_crop=args.center_crop,
+    )
+
+    train_dataloader = torch.utils.data.DataLoader(
+        train_dataset,
+        batch_size=args.train_batch_size,
+        shuffle=True,
+        collate_fn=lambda examples: collate_fn(examples, args.with_prior_preservation),
+        num_workers=args.dataloader_num_workers,
+    )
+
+    # If no type of tuning is done on the text_encoder and custom instance prompts are NOT
+    # provided (i.e. the --instance_prompt is used for all images), we encode the instance prompt once to avoid
+    # the redundant encoding.
+    if not args.train_text_encoder and not train_dataset.custom_instance_prompts:
+        instance_prompt_hidden_states, instance_pooled_prompt_embeds, instance_text_ids = compute_text_embeddings(
+            args.instance_prompt, text_encoders, tokenizers
+        )
+
+        if args.validation_prompt is not None:
+            validation_prompt_hidden_states, validation_pooled_prompt_embeds, _ = compute_text_embeddings(
+                args.validation_prompt, text_encoders, tokenizers
+            )
+
+    # Clear the memory here
+    if not args.train_text_encoder and not train_dataset.custom_instance_prompts:
+        del tokenizers, text_encoders
+        # Explicitly delete the objects as well, otherwise only the lists are deleted and the original references remain, preventing garbage collection
+        del text_encoder_one, text_encoder_two
+        gc.collect()
+        if torch.cuda.is_available():
+            torch.cuda.empty_cache()
+>>>>>>> 994d251 (Optimize prior generation VRAM usage)
 
     # If custom instance prompts are NOT provided (i.e. the instance prompt is used for all images),
     # pack the statically computed variables appropriately here. This is so that we don't
@@ -1654,6 +1656,11 @@ def main(args):
                     guidance = guidance.expand(model_input.shape[0])
                 else:
                     guidance = None
+
+                print("packed_noisy_model_input", packed_noisy_model_input.shape)
+                print("timesteps", timesteps)
+                print("t5 encoder_hidden_states", prompt_embeds.shape)
+                print("clip pooled_projections", pooled_prompt_embeds.shape)
 
                 # Predict the noise residual
                 model_pred = transformer(

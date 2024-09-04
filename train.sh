@@ -13,7 +13,11 @@ accelerate launch train_dreambooth_lora_flux.py \
   --prior_generation_precision "bf16" \
   --instance_prompt="A high-resolution photo of sks dog" \
   --class_prompt="A high-resolution photo of a dog" \
+<<<<<<< HEAD
   --resolution=1024 \
+=======
+  --resolution=512 \
+>>>>>>> 994d251 (Optimize prior generation VRAM usage)
   --train_batch_size=1 \
   --gradient_accumulation_steps=4 \
   --learning_rate=1e-5 \
@@ -25,5 +29,9 @@ accelerate launch train_dreambooth_lora_flux.py \
   --validation_epochs=30 \
   --num_class_images=200 \
   --seed="0" \
+<<<<<<< HEAD
   --rank=512
+=======
+  --rank=8
+>>>>>>> 994d251 (Optimize prior generation VRAM usage)
   --push_to_hub
