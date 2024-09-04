@@ -76,6 +76,8 @@ check_min_version("0.31.0.dev0")
 
 logger = get_logger(__name__)
 
+import subprocess
+from huggingface_hub import login
 
 def save_model_card(
     repo_id: str,
@@ -181,10 +183,10 @@ def log_validation(
 
     # run inference
     generator = torch.Generator(device=accelerator.device).manual_seed(args.seed) if args.seed else None
-    # autocast_ctx = torch.autocast(accelerator.device.type) if not is_final_validation else nullcontext()
-    autocast_ctx = nullcontext()
+    autocast_ctx = torch.autocast(accelerator.device.type)
+    # autocast_ctx = nullcontext()
 
-    with autocast_ctx:
+    with torch.inference_mode(), autocast_ctx:
         images = [pipeline(**pipeline_args, generator=generator).images[0] for _ in range(args.num_validation_images)]
 
     for tracker in accelerator.trackers:
@@ -337,7 +339,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--validation_epochs",
         type=int,
-        default=50,
+        default=500,
         help=(
             "Run dreambooth validation every X epochs. Dreambooth validation consists of running the prompt"
             " `args.validation_prompt` multiple times: `args.num_validation_images`."
@@ -346,7 +348,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--rank",
         type=int,
-        default=4,
+        default=1024,
         help=("The dimension of the LoRA update matrices."),
     )
     parser.add_argument(
@@ -404,7 +406,7 @@ def parse_args(input_args=None):
         "--train_batch_size", type=int, default=4, help="Batch size (per device) for the training dataloader."
     )
     parser.add_argument(
-        "--sample_batch_size", type=int, default=4, help="Batch size (per device) for sampling images."
+        "--sample_batch_size", type=int, default=2, help="Batch size (per device) for sampling images."
     )
     parser.add_argument("--num_train_epochs", type=int, default=1)
     parser.add_argument(
@@ -579,7 +581,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--hub_model_id",
         type=str,
-        default=None,
+        default="DarkMoonDragon/trained-flux",
         help="The name of the repository to keep in sync with the local `output_dir`.",
     )
     parser.add_argument(
@@ -998,6 +1000,17 @@ def encode_prompt(
 
 
 def main(args):
+    result = subprocess.run('bash -c "source /etc/network_turbo && env | grep proxy"', shell=True, capture_output=True, text=True)
+    output = result.stdout
+    for line in output.splitlines():
+        if '=' in line:
+            var, value = line.split('=', 1)
+            os.environ[var] = value
+
+    os.environ['HF_HOME'] = '/root/autodl-tmp/cache/'
+    os.environ['HF_HUB_CACHE'] = '/root/autodl-tmp/cache/hub/'
+    os.environ['HF_DATASETS_CACHE'] = '/root/autodl-tmp/cache/datasets/'
+
     if args.report_to == "wandb" and args.hub_token is not None:
         raise ValueError(
             "You cannot use both --report_to=wandb and --hub_token due to a security risk of exposing your token."
@@ -1047,53 +1060,6 @@ def main(args):
     # If passed along, set the training seed now.
     if args.seed is not None:
         set_seed(args.seed)
-
-    # Generate class images if prior preservation is enabled.
-    if args.with_prior_preservation:
-        class_images_dir = Path(args.class_data_dir)
-        if not class_images_dir.exists():
-            class_images_dir.mkdir(parents=True)
-        cur_class_images = len(list(class_images_dir.iterdir()))
-
-        if cur_class_images < args.num_class_images:
-            has_supported_fp16_accelerator = torch.cuda.is_available() or torch.backends.mps.is_available()
-            torch_dtype = torch.float16 if has_supported_fp16_accelerator else torch.float32
-            if args.prior_generation_precision == "fp32":
-                torch_dtype = torch.float32
-            elif args.prior_generation_precision == "fp16":
-                torch_dtype = torch.float16
-            elif args.prior_generation_precision == "bf16":
-                torch_dtype = torch.bfloat16
-            pipeline = FluxPipeline.from_pretrained(
-                args.pretrained_model_name_or_path,
-                torch_dtype=torch_dtype,
-                revision=args.revision,
-                variant=args.variant,
-            )
-            pipeline.set_progress_bar_config(disable=True)
-
-            num_new_images = args.num_class_images - cur_class_images
-            logger.info(f"Number of class images to sample: {num_new_images}.")
-
-            sample_dataset = PromptDataset(args.class_prompt, num_new_images)
-            sample_dataloader = torch.utils.data.DataLoader(sample_dataset, batch_size=args.sample_batch_size)
-
-            sample_dataloader = accelerator.prepare(sample_dataloader)
-            pipeline.to(accelerator.device)
-
-            for example in tqdm(
-                sample_dataloader, desc="Generating class images", disable=not accelerator.is_local_main_process
-            ):
-                images = pipeline(example["prompt"]).images
-
-                for i, image in enumerate(images):
-                    hash_image = insecure_hashlib.sha1(image.tobytes()).hexdigest()
-                    image_filename = class_images_dir / f"{example['index'][i] + cur_class_images}-{hash_image}.jpg"
-                    image.save(image_filename)
-
-            del pipeline
-            if torch.cuda.is_available():
-                torch.cuda.empty_cache()
 
     # Handle the repository creation
     if accelerator.is_main_process:
@@ -1335,41 +1301,6 @@ def main(args):
             eps=args.adam_epsilon,
         )
 
-    if args.optimizer.lower() == "prodigy":
-        try:
-            import prodigyopt
-        except ImportError:
-            raise ImportError("To use Prodigy, please install the prodigyopt library: `pip install prodigyopt`")
-
-        optimizer_class = prodigyopt.Prodigy
-
-        if args.learning_rate <= 0.1:
-            logger.warning(
-                "Learning rate is too low. When using prodigy, it's generally better to set learning rate around 1.0"
-            )
-        if args.train_text_encoder and args.text_encoder_lr:
-            logger.warning(
-                f"Learning rates were provided both for the transformer and the text encoder- e.g. text_encoder_lr:"
-                f" {args.text_encoder_lr} and learning_rate: {args.learning_rate}. "
-                f"When using prodigy only learning_rate is used as the initial learning rate."
-            )
-            # changes the learning rate of text_encoder_parameters_one and text_encoder_parameters_two to be
-            # --learning_rate
-            params_to_optimize[1]["lr"] = args.learning_rate
-            params_to_optimize[2]["lr"] = args.learning_rate
-
-        optimizer = optimizer_class(
-            params_to_optimize,
-            lr=args.learning_rate,
-            betas=(args.adam_beta1, args.adam_beta2),
-            beta3=args.prodigy_beta3,
-            weight_decay=args.adam_weight_decay,
-            eps=args.adam_epsilon,
-            decouple=args.prodigy_decouple,
-            use_bias_correction=args.prodigy_use_bias_correction,
-            safeguard_warmup=args.prodigy_safeguard_warmup,
-        )
-
     # Dataset and DataLoaders creation:
     train_dataset = DreamBoothDataset(
         instance_data_root=args.instance_data_dir,
@@ -1412,6 +1343,11 @@ def main(args):
             args.instance_prompt, text_encoders, tokenizers
         )
 
+        if args.validation_prompt is not None:
+            validation_prompt_hidden_states, validation_pooled_prompt_embeds, _ = compute_text_embeddings(
+                args.validation_prompt, text_encoders, tokenizers
+            )
+
     # Handle class prompt for prior-preservation.
     if args.with_prior_preservation:
         if not args.train_text_encoder:
@@ -1427,6 +1363,65 @@ def main(args):
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
+
+    # Generate class images if prior preservation is enabled.
+    if args.with_prior_preservation:
+        class_images_dir = Path(args.class_data_dir)
+        if not class_images_dir.exists():
+            class_images_dir.mkdir(parents=True)
+        cur_class_images = len(list(class_images_dir.iterdir()))
+
+        if cur_class_images < args.num_class_images:
+            has_supported_fp16_accelerator = torch.cuda.is_available() or torch.backends.mps.is_available()
+            torch_dtype = torch.float16 if has_supported_fp16_accelerator else torch.float32
+            if args.prior_generation_precision == "fp32":
+                torch_dtype = torch.float32
+            elif args.prior_generation_precision == "fp16":
+                torch_dtype = torch.float16
+            elif args.prior_generation_precision == "bf16":
+                torch_dtype = torch.bfloat16
+            pipeline = FluxPipeline.from_pretrained(
+                args.pretrained_model_name_or_path,
+                    vae=vae,
+                    text_encoder=None,
+                    text_encoder_2=None,
+                    transformer=transformer,
+                    revision=args.revision,
+                    variant=args.variant,
+                    torch_dtype=torch_dtype,
+            )
+            pipeline.set_progress_bar_config(disable=True)
+
+            num_new_images = args.num_class_images - cur_class_images
+            logger.info(f"Number of class images to sample: {num_new_images}.")
+
+            sample_dataset = PromptDataset(args.class_prompt, num_new_images)
+            sample_dataloader = torch.utils.data.DataLoader(sample_dataset, batch_size=args.sample_batch_size)
+
+            sample_dataloader = accelerator.prepare(sample_dataloader)
+            pipeline.to(accelerator.device)
+
+            for example in tqdm(
+                sample_dataloader, desc="Generating class images", disable=not accelerator.is_local_main_process
+            ):
+                print(f"Generating class images {example['index'] + cur_class_images}")
+                images = pipeline(prompt_embeds=class_prompt_hidden_states,
+                                  pooled_prompt_embeds=class_pooled_prompt_embeds,
+                                  num_images_per_prompt=args.sample_batch_size,
+                                  height=1024,
+                                  width=1024,
+                                  num_inference_steps=50,
+                                  guidance_scale=args.guidance_scale,
+                                  ).images
+
+                for i, image in enumerate(images):
+                    hash_image = insecure_hashlib.sha1(image.tobytes()).hexdigest()
+                    image_filename = class_images_dir / f"{example['index'][i] + cur_class_images}-{hash_image}.jpg"
+                    image.save(image_filename)
+
+            del pipeline
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
 
     # If custom instance prompts are NOT provided (i.e. the instance prompt is used for all images),
     # pack the statically computed variables appropriately here. This is so that we don't
@@ -1764,19 +1759,20 @@ def main(args):
         if accelerator.is_main_process:
             if args.validation_prompt is not None and epoch % args.validation_epochs == 0:
                 # create pipeline
-                if not args.train_text_encoder:
-                    text_encoder_one, text_encoder_two = load_text_encoders(text_encoder_cls_one, text_encoder_cls_two)
+                # if not args.train_text_encoder:
+                #     text_encoder_one, text_encoder_two = load_text_encoders(text_encoder_cls_one, text_encoder_cls_two)
                 pipeline = FluxPipeline.from_pretrained(
                     args.pretrained_model_name_or_path,
                     vae=vae,
-                    text_encoder=accelerator.unwrap_model(text_encoder_one),
-                    text_encoder_2=accelerator.unwrap_model(text_encoder_two),
+                    text_encoder=None,
+                    text_encoder_2=None,
                     transformer=accelerator.unwrap_model(transformer),
                     revision=args.revision,
                     variant=args.variant,
                     torch_dtype=weight_dtype,
                 )
-                pipeline_args = {"prompt": args.validation_prompt}
+                pipeline_args = {"prompt_embeds": validation_prompt_hidden_states, 
+                                 "pooled_prompt_embeds": validation_pooled_prompt_embeds,}
                 images = log_validation(
                     pipeline=pipeline,
                     args=args,
@@ -1785,7 +1781,7 @@ def main(args):
                     epoch=epoch,
                 )
                 if not args.train_text_encoder:
-                    del text_encoder_one, text_encoder_two
+                    # del text_encoder_one, text_encoder_two
                     torch.cuda.empty_cache()
                     gc.collect()
 
