@@ -1380,8 +1380,6 @@ def main(args):
                     torch.cuda.empty_cache()
 
             del pipeline
-<<<<<<< HEAD
-=======
 
     # Dataset and DataLoaders creation:
     train_dataset = DreamBoothDataset(
@@ -1424,7 +1422,6 @@ def main(args):
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
->>>>>>> 994d251 (Optimize prior generation VRAM usage)
 
     # If custom instance prompts are NOT provided (i.e. the instance prompt is used for all images),
     # pack the statically computed variables appropriately here. This is so that we don't
