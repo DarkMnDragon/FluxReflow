@@ -251,28 +251,37 @@ def parse_args(input_args=None):
         default=None,
         help="Variant of the model files of the pretrained model identifier from huggingface.co/models, 'e.g.' fp16",
     )
+
+    # ReflowDataset
     parser.add_argument(
-        "--dataset_name",
+        "--img_root",
         type=str,
         default=None,
-        help=(
-            "The name of the Dataset (from the HuggingFace hub) containing the training data of instance images (could be your own, possibly private,"
-            " dataset). It can also be a path pointing to a local copy of a dataset in your filesystem,"
-            " or to a folder containing files that 🤗 Datasets can understand."
-        ),
+        required=True,
+        help="Path to the root folder containing the images.",
     )
     parser.add_argument(
-        "--dataset_config_name",
+        "--prompt_root",
         type=str,
         default=None,
-        help="The config of the Dataset, leave as None if there's only one config.",
+        required=True,
+        help="Path to the root folder containing the prompts.",
     )
     parser.add_argument(
-        "--instance_data_dir",
+        "--prior_latent_root",
         type=str,
         default=None,
-        help=("A folder containing the training data. "),
+        required=True,
+        help="Path to the root folder containing the prior latents.",
     )
+    parser.add_argument(
+        "--img_latent_root",
+        type=str,
+        default=None,
+        required=True,
+        help="Path to the root folder containing the image latents.",
+    )
+
 
     parser.add_argument(
         "--cache_dir",
@@ -281,43 +290,6 @@ def parse_args(input_args=None):
         help="The directory where the downloaded models and datasets will be stored.",
     )
 
-    parser.add_argument(
-        "--image_column",
-        type=str,
-        default="image",
-        help="The column of the dataset containing the target image. By "
-        "default, the standard Image Dataset maps out 'file_name' "
-        "to 'image'.",
-    )
-    parser.add_argument(
-        "--caption_column",
-        type=str,
-        default=None,
-        help="The column of the dataset containing the instance prompt for each image",
-    )
-
-    parser.add_argument("--repeats", type=int, default=1, help="How many times to repeat the training data.")
-
-    parser.add_argument(
-        "--class_data_dir",
-        type=str,
-        default=None,
-        required=False,
-        help="A folder containing the training data of class images.",
-    )
-    parser.add_argument(
-        "--instance_prompt",
-        type=str,
-        default=None,
-        required=True,
-        help="The prompt with identifier specifying the instance, e.g. 'photo of a TOK dog', 'in the style of TOK'",
-    )
-    parser.add_argument(
-        "--class_prompt",
-        type=str,
-        default=None,
-        help="The prompt to specify images in the same class as provided instance images.",
-    )
     parser.add_argument(
         "--max_sequence_length",
         type=int,
@@ -350,22 +322,6 @@ def parse_args(input_args=None):
         type=int,
         default=1024,
         help=("The dimension of the LoRA update matrices."),
-    )
-    parser.add_argument(
-        "--with_prior_preservation",
-        default=False,
-        action="store_true",
-        help="Flag to add prior preservation loss.",
-    )
-    parser.add_argument("--prior_loss_weight", type=float, default=1.0, help="The weight of prior preservation loss.")
-    parser.add_argument(
-        "--num_class_images",
-        type=int,
-        default=100,
-        help=(
-            "Minimal class images for prior preservation loss. If there are not enough images already present in"
-            " class_data_dir, additional images will be sampled with class_prompt."
-        ),
     )
     parser.add_argument(
         "--output_dir",
@@ -403,7 +359,7 @@ def parse_args(input_args=None):
         help="Whether to train the text encoder. If set, the text encoder should be float32 precision.",
     )
     parser.add_argument(
-        "--train_batch_size", type=int, default=4, help="Batch size (per device) for the training dataloader."
+        "--train_batch_size", type=int, default=2, help="Batch size (per device) for the training dataloader."
     )
     parser.add_argument(
         "--sample_batch_size", type=int, default=2, help="Batch size (per device) for sampling images."
@@ -621,16 +577,6 @@ def parse_args(input_args=None):
             " flag passed with the `accelerate.launch` command. Use this argument to override the accelerate config."
         ),
     )
-    parser.add_argument(
-        "--prior_generation_precision",
-        type=str,
-        default=None,
-        choices=["no", "fp32", "fp16", "bf16"],
-        help=(
-            "Choose prior generation precision between fp32, fp16 and bf16 (bfloat16). Bf16 requires PyTorch >="
-            " 1.10.and an Nvidia Ampere GPU.  Default to  fp16 if a GPU is available else fp32."
-        ),
-    )
     parser.add_argument("--local_rank", type=int, default=-1, help="For distributed training: local_rank")
 
     if input_args is not None:
@@ -638,232 +584,97 @@ def parse_args(input_args=None):
     else:
         args = parser.parse_args()
 
-    if args.dataset_name is None and args.instance_data_dir is None:
-        raise ValueError("Specify either `--dataset_name` or `--instance_data_dir`")
-
-    if args.dataset_name is not None and args.instance_data_dir is not None:
-        raise ValueError("Specify only one of `--dataset_name` or `--instance_data_dir`")
-
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
 
-    if args.with_prior_preservation:
-        if args.class_data_dir is None:
-            raise ValueError("You must specify a data directory for class images.")
-        if args.class_prompt is None:
-            raise ValueError("You must specify prompt for class images.")
-    else:
-        # logger is not available yet
-        if args.class_data_dir is not None:
-            warnings.warn("You need not use --class_data_dir without --with_prior_preservation.")
-        if args.class_prompt is not None:
-            warnings.warn("You need not use --class_prompt without --with_prior_preservation.")
-
     return args
 
 
-class DreamBoothDataset(Dataset):
+class ReflowDataset(Dataset):
     """
-    A dataset to prepare the instance and class images with the prompts for fine-tuning the model.
-    It pre-processes the images.
+    A dataset containing the reflow pairs and precomputed prompts.
     """
 
     def __init__(
         self,
-        instance_data_root,
-        instance_prompt,
-        class_prompt,
-        class_data_root=None,
-        class_num=None,
+        img_root,
+        prompt_root,
+        prior_latent_root,
+        img_latent_root,
         size=1024,
-        repeats=1,
-        center_crop=False,
     ):
-        self.size = size
-        self.center_crop = center_crop
+        self.size = size # img size
+        self.img_root = Path(img_root)
+        self.prompt_root = Path(prompt_root)
+        self.prior_latent_root = Path(prior_latent_root)
+        self.img_latent_root = Path(img_latent_root)
 
-        self.instance_prompt = instance_prompt
-        self.custom_instance_prompts = None
-        self.class_prompt = class_prompt
+        self.img_paths = sorted(self.img_root.glob('*.png'))
+        self.prompt_paths = sorted(self.prompt_root.glob('*.pt'))
+        self.prior_latent_paths = sorted(self.prior_latent_root.glob('*.pt'))
+        self.img_latent_paths = sorted(self.img_latent_root.glob('*.pt'))
 
-        # if --dataset_name is provided or a metadata jsonl file is provided in the local --instance_data directory,
-        # we load the training data using load_dataset
-        if args.dataset_name is not None:
-            try:
-                from datasets import load_dataset
-            except ImportError:
-                raise ImportError(
-                    "You are trying to load your data using the datasets library. If you wish to train using custom "
-                    "captions please install the datasets library: `pip install datasets`. If you wish to load a "
-                    "local folder containing images only, specify --instance_data_dir instead."
-                )
-            # Downloading and loading a dataset from the hub.
-            # See more about loading custom images at
-            # https://huggingface.co/docs/datasets/v2.0.0/en/dataset_script
-            dataset = load_dataset(
-                args.dataset_name,
-                args.dataset_config_name,
-                cache_dir=args.cache_dir,
-            )
-            # Preprocessing the datasets.
-            column_names = dataset["train"].column_names
+        self.img_transform = transforms.Compose([
+            transforms.ToTensor(),
+            transforms.Normalize([0.5], [0.5]),
+        ])
 
-            # 6. Get the column names for input/target.
-            if args.image_column is None:
-                image_column = column_names[0]
-                logger.info(f"image column defaulting to {image_column}")
-            else:
-                image_column = args.image_column
-                if image_column not in column_names:
-                    raise ValueError(
-                        f"`--image_column` value '{args.image_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
-                    )
-            instance_images = dataset["train"][image_column]
+        assert len(self.img_paths) == len(self.prompt_paths) == len(self.prior_latent_paths) == len(self.img_latent_paths), \
+            "Number of images, prompts, z0 and z1 should be the same."
 
-            if args.caption_column is None:
-                logger.info(
-                    "No caption column provided, defaulting to instance_prompt for all images. If your dataset "
-                    "contains captions/prompts for the images, make sure to specify the "
-                    "column as --caption_column"
-                )
-                self.custom_instance_prompts = None
-            else:
-                if args.caption_column not in column_names:
-                    raise ValueError(
-                        f"`--caption_column` value '{args.caption_column}' not found in dataset columns. Dataset columns are: {', '.join(column_names)}"
-                    )
-                custom_instance_prompts = dataset["train"][args.caption_column]
-                # create final list of captions according to --repeats
-                self.custom_instance_prompts = []
-                for caption in custom_instance_prompts:
-                    self.custom_instance_prompts.extend(itertools.repeat(caption, repeats))
-        else:
-            self.instance_data_root = Path(instance_data_root)
-            if not self.instance_data_root.exists():
-                raise ValueError("Instance images root doesn't exists.")
-
-            instance_images = [Image.open(path) for path in list(Path(instance_data_root).iterdir())]
-            self.custom_instance_prompts = None
-
-        self.instance_images = []
-        for img in instance_images:
-            self.instance_images.extend(itertools.repeat(img, repeats))
-
-        self.pixel_values = []
-        train_resize = transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR)
-        train_crop = transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size)
-        train_flip = transforms.RandomHorizontalFlip(p=1.0)
-        train_transforms = transforms.Compose(
-            [
-                transforms.ToTensor(),
-                transforms.Normalize([0.5], [0.5]),
-            ]
-        )
-        for image in self.instance_images:
-            image = exif_transpose(image)
-            if not image.mode == "RGB":
-                image = image.convert("RGB")
-            image = train_resize(image)
-            if args.random_flip and random.random() < 0.5:
-                # flip
-                image = train_flip(image)
-            if args.center_crop:
-                y1 = max(0, int(round((image.height - args.resolution) / 2.0)))
-                x1 = max(0, int(round((image.width - args.resolution) / 2.0)))
-                image = train_crop(image)
-            else:
-                y1, x1, h, w = train_crop.get_params(image, (args.resolution, args.resolution))
-                image = crop(image, y1, x1, h, w)
-            image = train_transforms(image)
-            self.pixel_values.append(image)
-
-        self.num_instance_images = len(self.instance_images)
-        self._length = self.num_instance_images
-
-        if class_data_root is not None:
-            self.class_data_root = Path(class_data_root)
-            self.class_data_root.mkdir(parents=True, exist_ok=True)
-            self.class_images_path = list(self.class_data_root.iterdir())
-            if class_num is not None:
-                self.num_class_images = min(len(self.class_images_path), class_num)
-            else:
-                self.num_class_images = len(self.class_images_path)
-            self._length = max(self.num_class_images, self.num_instance_images)
-        else:
-            self.class_data_root = None
-
-        self.image_transforms = transforms.Compose(
-            [
-                transforms.Resize(size, interpolation=transforms.InterpolationMode.BILINEAR),
-                transforms.CenterCrop(size) if center_crop else transforms.RandomCrop(size),
-                transforms.ToTensor(),
-                transforms.Normalize([0.5], [0.5]),
-            ]
-        )
+        print(f"Loaded {len(self)} reflow pairs.")
 
     def __len__(self):
-        return self._length
+        return len(self.img_paths)
 
     def __getitem__(self, index):
-        example = {}
-        instance_image = self.pixel_values[index % self.num_instance_images]
-        example["instance_images"] = instance_image
+        # Load image
+        img_path = self.img_paths[index]
+        image = Image.open(img_path)
+        image = exif_transpose(image)
+        if not image.mode == "RGB": image = image.convert("RGB")
+        image = self.img_transform(image)
 
-        if self.custom_instance_prompts:
-            caption = self.custom_instance_prompts[index % self.num_instance_images]
-            if caption:
-                example["instance_prompt"] = caption
-            else:
-                example["instance_prompt"] = self.instance_prompt
+        # Load prompt & embeddings
+        prompt_path = self.prompt_paths[index]
+        prompt_data = torch.load(prompt_path, map_location=torch.device("cpu"))
+        prompt = prompt_data["prompt"]
+        prompt_embed = prompt_data["prompt_embeds"].squeeze(0)
+        pooled_prompt_embed = prompt_data["pooled_prompt_embeds"].squeeze(0)
 
-        else:  # custom prompts were provided, but length does not match size of image dataset
-            example["instance_prompt"] = self.instance_prompt
+        # Load reflow pairs
+        prior_latent_path = self.prior_latent_paths[index]
+        img_latent_path = self.img_latent_paths[index]
+        prior_latent = torch.load(prior_latent_path, map_location=torch.device("cpu")).squeeze(0)
+        img_latent = torch.load(img_latent_path, map_location=torch.device("cpu")).squeeze(0)
 
-        if self.class_data_root:
-            class_image = Image.open(self.class_images_path[index % self.num_class_images])
-            class_image = exif_transpose(class_image)
-
-            if not class_image.mode == "RGB":
-                class_image = class_image.convert("RGB")
-            example["class_images"] = self.image_transforms(class_image)
-            example["class_prompt"] = self.class_prompt
-
-        return example
-
-
-def collate_fn(examples, with_prior_preservation=False):
-    pixel_values = [example["instance_images"] for example in examples]
-    prompts = [example["instance_prompt"] for example in examples]
-
-    # Concat class and instance examples for prior preservation.
-    # We do this to avoid doing two forward passes.
-    if with_prior_preservation:
-        pixel_values += [example["class_images"] for example in examples]
-        prompts += [example["class_prompt"] for example in examples]
-
-    pixel_values = torch.stack(pixel_values)
-    pixel_values = pixel_values.to(memory_format=torch.contiguous_format).float()
-
-    batch = {"pixel_values": pixel_values, "prompts": prompts}
-    return batch
+        return {
+            "images": image,
+            "prompts": prompt,
+            "prompt_embeds": prompt_embed,
+            "pooled_prompt_embeds": pooled_prompt_embed,
+            "prior_latents": prior_latent,  # prior latents in VAE space
+            "img_latents": img_latent,      # img latents in VAE space
+        }
 
 
-class PromptDataset(Dataset):
-    "A simple dataset to prepare the prompts to generate class images on multiple GPUs."
+def collate_fn(batch):
+    images = torch.stack([item['images'] for item in batch])  # img tensors
+    prompts = [item['prompts'] for item in batch]             # strings
+    prompt_embeds = torch.stack([item['prompt_embeds'] for item in batch])  # prompt_embeds tensors
+    pooled_prompt_embeds = torch.stack([item['pooled_prompt_embeds'] for item in batch])  # pooled_prompt_embeds tensors
+    prior_latents = torch.stack([item['prior_latents'] for item in batch])  # prior_latents tensors
+    img_latents = torch.stack([item['img_latents'] for item in batch])      # img_latents tensors
 
-    def __init__(self, prompt, num_samples):
-        self.prompt = prompt
-        self.num_samples = num_samples
-
-    def __len__(self):
-        return self.num_samples
-
-    def __getitem__(self, index):
-        example = {}
-        example["prompt"] = self.prompt
-        example["index"] = index
-        return example
+    return {
+        "images": images,
+        "prompts": prompts,
+        "prompt_embeds": prompt_embeds,
+        "pooled_prompt_embeds": pooled_prompt_embeds,
+        "prior_latents": prior_latents,
+        "img_latents": img_latents,
+    }
 
 
 def tokenize_prompt(tokenizer, prompt, max_sequence_length):
@@ -1294,6 +1105,41 @@ def main(args):
             eps=args.adam_epsilon,
         )
 
+    if args.optimizer.lower() == "prodigy":
+        try:
+            import prodigyopt
+        except ImportError:
+            raise ImportError("To use Prodigy, please install the prodigyopt library: `pip install prodigyopt`")
+
+        optimizer_class = prodigyopt.Prodigy
+
+        if args.learning_rate <= 0.1:
+            logger.warning(
+                "Learning rate is too low. When using prodigy, it's generally better to set learning rate around 1.0"
+            )
+        if args.train_text_encoder and args.text_encoder_lr:
+            logger.warning(
+                f"Learning rates were provided both for the transformer and the text encoder- e.g. text_encoder_lr:"
+                f" {args.text_encoder_lr} and learning_rate: {args.learning_rate}. "
+                f"When using prodigy only learning_rate is used as the initial learning rate."
+            )
+            # changes the learning rate of text_encoder_parameters_one and text_encoder_parameters_two to be
+            # --learning_rate
+            params_to_optimize[1]["lr"] = args.learning_rate
+            params_to_optimize[2]["lr"] = args.learning_rate
+
+        optimizer = optimizer_class(
+            params_to_optimize,
+            lr=args.learning_rate,
+            betas=(args.adam_beta1, args.adam_beta2),
+            beta3=args.prodigy_beta3,
+            weight_decay=args.adam_weight_decay,
+            eps=args.adam_epsilon,
+            decouple=args.prodigy_decouple,
+            use_bias_correction=args.prodigy_use_bias_correction,
+            safeguard_warmup=args.prodigy_safeguard_warmup,
+        )
+
     if not args.train_text_encoder:
         tokenizers = [tokenizer_one, tokenizer_two]
         text_encoders = [text_encoder_one, text_encoder_two]
@@ -1307,145 +1153,37 @@ def main(args):
                 pooled_prompt_embeds = pooled_prompt_embeds.to(accelerator.device)
                 text_ids = text_ids.to(accelerator.device)
             return prompt_embeds, pooled_prompt_embeds, text_ids
-    
-    # Handle class prompt for prior-preservation.
-    if args.with_prior_preservation:
-        if not args.train_text_encoder:
-            class_prompt_hidden_states, class_pooled_prompt_embeds, class_text_ids = compute_text_embeddings(
-                args.class_prompt, text_encoders, tokenizers
-            )
-            
-        # Generate class images if prior preservation is enabled.
-        class_images_dir = Path(args.class_data_dir)
-        if not class_images_dir.exists():
-            class_images_dir.mkdir(parents=True)
-        cur_class_images = len(list(class_images_dir.iterdir()))
-
-        if cur_class_images < args.num_class_images:
-            has_supported_fp16_accelerator = torch.cuda.is_available() or torch.backends.mps.is_available()
-            torch_dtype = torch.float16 if has_supported_fp16_accelerator else torch.float32
-            if args.prior_generation_precision == "fp32":
-                torch_dtype = torch.float32
-            elif args.prior_generation_precision == "fp16":
-                torch_dtype = torch.float16
-            elif args.prior_generation_precision == "bf16":
-                torch_dtype = torch.bfloat16
-            pipeline = FluxPipeline.from_pretrained(
-                args.pretrained_model_name_or_path,
-                    vae=vae,
-                    text_encoder=None,
-                    text_encoder_2=None,
-                    transformer=transformer,
-                    revision=args.revision,
-                    variant=args.variant,
-                    torch_dtype=torch_dtype,
-            )
-            pipeline.set_progress_bar_config(disable=True)
-
-            num_new_images = args.num_class_images - cur_class_images
-            logger.info(f"Number of class images to sample: {num_new_images}.")
-
-            sample_dataset = PromptDataset(args.class_prompt, num_new_images)
-            sample_dataloader = torch.utils.data.DataLoader(sample_dataset, batch_size=args.sample_batch_size)
-
-            sample_dataloader = accelerator.prepare(sample_dataloader)
-            pipeline.to(accelerator.device)
-
-            for example in tqdm(
-                sample_dataloader, desc="Generating class images", disable=not accelerator.is_local_main_process
-            ):
-                print(f"Generating class images {example['index'] + cur_class_images}")
-                images = pipeline(prompt_embeds=class_prompt_hidden_states,
-                                  pooled_prompt_embeds=class_pooled_prompt_embeds,
-                                  num_images_per_prompt=args.sample_batch_size,
-                                  height=1024,
-                                  width=1024,
-                                  num_inference_steps=50,
-                                  guidance_scale=args.guidance_scale,
-                                  ).images
-
-                for i, image in enumerate(images):
-                    hash_image = insecure_hashlib.sha1(image.tobytes()).hexdigest()
-                    image_filename = class_images_dir / f"{example['index'][i] + cur_class_images}-{hash_image}.jpg"
-                    image.save(image_filename)
-                    
-                if torch.cuda.is_available():
-                    torch.cuda.empty_cache()
-
-            del pipeline
 
     # Dataset and DataLoaders creation:
-    train_dataset = DreamBoothDataset(
-        instance_data_root=args.instance_data_dir,
-        instance_prompt=args.instance_prompt,
-        class_prompt=args.class_prompt,
-        class_data_root=args.class_data_dir if args.with_prior_preservation else None,
-        class_num=args.num_class_images,
+    train_dataset = ReflowDataset(
+        img_root=args.img_root,
+        prompt_root=args.prompt_root,
+        prior_latent_root=args.prior_latent_root,
+        img_latent_root=args.img_latent_root,
         size=args.resolution,
-        repeats=args.repeats,
-        center_crop=args.center_crop,
     )
 
     train_dataloader = torch.utils.data.DataLoader(
         train_dataset,
         batch_size=args.train_batch_size,
         shuffle=True,
-        collate_fn=lambda examples: collate_fn(examples, args.with_prior_preservation),
+        collate_fn=lambda batch: collate_fn(batch),
         num_workers=args.dataloader_num_workers,
     )
 
-    # If no type of tuning is done on the text_encoder and custom instance prompts are NOT
-    # provided (i.e. the --instance_prompt is used for all images), we encode the instance prompt once to avoid
-    # the redundant encoding.
-    if not args.train_text_encoder and not train_dataset.custom_instance_prompts:
-        instance_prompt_hidden_states, instance_pooled_prompt_embeds, instance_text_ids = compute_text_embeddings(
-            args.instance_prompt, text_encoders, tokenizers
+    if not args.train_text_encoder and args.validation_prompt is not None:
+        validation_prompt_hidden_states, validation_pooled_prompt_embeds, _ = compute_text_embeddings(
+                args.validation_prompt, text_encoders, tokenizers
         )
 
-        if args.validation_prompt is not None:
-            validation_prompt_hidden_states, validation_pooled_prompt_embeds, _ = compute_text_embeddings(
-                args.validation_prompt, text_encoders, tokenizers
-            )
-
     # Clear the memory here
-    if not args.train_text_encoder and not train_dataset.custom_instance_prompts:
+    if not args.train_text_encoder:
         del tokenizers, text_encoders
         # Explicitly delete the objects as well, otherwise only the lists are deleted and the original references remain, preventing garbage collection
         del text_encoder_one, text_encoder_two
         gc.collect()
         if torch.cuda.is_available():
             torch.cuda.empty_cache()
-
-    # If custom instance prompts are NOT provided (i.e. the instance prompt is used for all images),
-    # pack the statically computed variables appropriately here. This is so that we don't
-    # have to pass them to the dataloader.
-
-    if not train_dataset.custom_instance_prompts:
-        if not args.train_text_encoder:
-            prompt_embeds = instance_prompt_hidden_states
-            pooled_prompt_embeds = instance_pooled_prompt_embeds
-            text_ids = instance_text_ids
-            if args.with_prior_preservation:
-                prompt_embeds = torch.cat([prompt_embeds, class_prompt_hidden_states], dim=0)
-                pooled_prompt_embeds = torch.cat([pooled_prompt_embeds, class_pooled_prompt_embeds], dim=0)
-                text_ids = torch.cat([text_ids, class_text_ids], dim=0)
-            prompt_embeds = prompt_embeds.repeat(args.train_batch_size, 1, 1)
-            pooled_prompt_embeds = pooled_prompt_embeds.repeat(args.train_batch_size, 1)
-            text_ids = text_ids.repeat(args.train_batch_size, 1, 1)
-        # if we're optimizing the text encoder (both if instance prompt is used for all images or custom prompts)
-        # we need to tokenize and encode the batch prompts on all training steps
-        else:
-            tokens_one = tokenize_prompt(tokenizer_one, args.instance_prompt, max_sequence_length=77)
-            tokens_two = tokenize_prompt(
-                tokenizer_two, args.instance_prompt, max_sequence_length=args.max_sequence_length
-            )
-            if args.with_prior_preservation:
-                class_tokens_one = tokenize_prompt(tokenizer_one, args.class_prompt, max_sequence_length=77)
-                class_tokens_two = tokenize_prompt(
-                    tokenizer_two, args.class_prompt, max_sequence_length=args.max_sequence_length
-                )
-                tokens_one = torch.cat([tokens_one, class_tokens_one], dim=0)
-                tokens_two = torch.cat([tokens_two, class_tokens_two], dim=0)
 
     # Scheduler and math around the number of training steps.
     overrode_max_train_steps = False
@@ -1569,112 +1307,81 @@ def main(args):
             if args.train_text_encoder:
                 models_to_accumulate.extend([text_encoder_one])
             with accelerator.accumulate(models_to_accumulate):
-                pixel_values = batch["pixel_values"].to(dtype=vae.dtype)
-                prompts = batch["prompts"]
+                prompt = batch["prompts"]
+                print("prompt", prompt)
+                prompt_embeds = batch["prompt_embeds"].to(dtype=weight_dtype)
+                pooled_prompt_embeds = batch["pooled_prompt_embeds"].to(dtype=weight_dtype)
+                text_ids = torch.zeros(prompt_embeds.shape[0], prompt_embeds.shape[1], 3,
+                                       device=prompt_embeds.device, dtype=weight_dtype)
 
-                # encode batch prompts when custom prompts are provided for each image -
-                if train_dataset.custom_instance_prompts:
-                    if not args.train_text_encoder:
-                        prompt_embeds, pooled_prompt_embeds, text_ids = compute_text_embeddings(
-                            prompts, text_encoders, tokenizers
-                        )
-                    else:
-                        tokens_one = tokenize_prompt(tokenizer_one, prompts, max_sequence_length=77)
-                        tokens_two = tokenize_prompt(
-                            tokenizer_two, prompts, max_sequence_length=args.max_sequence_length
-                        )
-                        prompt_embeds, pooled_prompt_embeds, text_ids = encode_prompt(
-                            text_encoders=[text_encoder_one, text_encoder_two],
-                            tokenizers=[None, None],
-                            text_input_ids_list=[tokens_one, tokens_two],
-                            max_sequence_length=args.max_sequence_length,
-                            prompt=prompts,
-                        )
-                else:
-                    if args.train_text_encoder:
-                        prompt_embeds, pooled_prompt_embeds, text_ids = encode_prompt(
-                            text_encoders=[text_encoder_one, text_encoder_two],
-                            tokenizers=[None, None],
-                            text_input_ids_list=[tokens_one, tokens_two],
-                            max_sequence_length=args.max_sequence_length,
-                            prompt=args.instance_prompt,
-                        )
-
-                # Convert images to latent space, e.g. [B, 3, 512, 512] -> [B, 16, 64, 64]
-                model_input = vae.encode(pixel_values).latent_dist.sample()
-                model_input = (model_input - vae.config.shift_factor) * vae.config.scaling_factor
-                model_input = model_input.to(dtype=weight_dtype)
-
-                vae_scale_factor = 2 ** (len(vae.config.block_out_channels))
-
-                latent_image_ids = FluxPipeline._prepare_latent_image_ids(
-                    model_input.shape[0],
-                    model_input.shape[2],
-                    model_input.shape[3],
+                img_latents = batch["img_latents"].to(dtype=weight_dtype)     # [B, 16, H//8, W//8]
+                prior_latents = batch["prior_latents"].to(dtype=weight_dtype) # [B, 16, H//8, W//8]
+                latent_ids = FluxPipeline._prepare_latent_image_ids(
+                    img_latents.shape[0],
+                    img_latents.shape[2],
+                    img_latents.shape[3],
                     accelerator.device,
                     weight_dtype,
                 )
-                # Sample noise that we'll add to the latents
-                noise = torch.randn_like(model_input)
-                bsz = model_input.shape[0]
 
                 # Sample a random timestep for each image
                 # for weighting schemes where we sample timesteps non-uniformly
                 u = compute_density_for_timestep_sampling(
                     weighting_scheme=args.weighting_scheme,
-                    batch_size=bsz,
+                    batch_size=img_latents.shape[0],
                     logit_mean=args.logit_mean,
                     logit_std=args.logit_std,
                     mode_scale=args.mode_scale,
                 )
                 indices = (u * noise_scheduler_copy.config.num_train_timesteps).long()
-                timesteps = noise_scheduler_copy.timesteps[indices].to(device=model_input.device)
+                timesteps = noise_scheduler_copy.timesteps[indices].to(device=img_latents.device)
 
                 # Add noise according to flow matching.
                 # zt = (1 - texp) * x + texp * z1
-                sigmas = get_sigmas(timesteps, n_dim=model_input.ndim, dtype=model_input.dtype)
+                sigmas = get_sigmas(timesteps, n_dim=img_latents.ndim, dtype=img_latents.dtype)
                 # print("sigmas", sigmas.shape, sigmas)
-                noisy_model_input = (1.0 - sigmas) * model_input + sigmas * noise
+                latents_interp = (1.0 - sigmas) * img_latents + sigmas * prior_latents
 
-                packed_noisy_model_input = FluxPipeline._pack_latents(
-                    noisy_model_input,
-                    batch_size=model_input.shape[0],
-                    num_channels_latents=model_input.shape[1],
-                    height=model_input.shape[2],
-                    width=model_input.shape[3],
+                packed_latents_interp = FluxPipeline._pack_latents(  # [B, (H//8*W//8), 16*2*2]
+                    latents_interp,
+                    batch_size=img_latents.shape[0],
+                    num_channels_latents=img_latents.shape[1],
+                    height=img_latents.shape[2],
+                    width=img_latents.shape[3],
                 )
 
                 # handle guidance
                 if transformer.config.guidance_embeds:
                     guidance = torch.tensor([args.guidance_scale], device=accelerator.device)
-                    guidance = guidance.expand(model_input.shape[0])
+                    guidance = guidance.expand(packed_latents_interp.shape[0])
                 else:
                     guidance = None
 
-                print("packed_noisy_model_input", packed_noisy_model_input.shape)
+                print("packed_latents_interp", packed_latents_interp.shape)
                 print("timesteps", timesteps)
                 print("t5 encoder_hidden_states", prompt_embeds.shape)
                 print("clip pooled_projections", pooled_prompt_embeds.shape)
                 print("text_ids", text_ids.shape)
-                print("latent_image_ids", latent_image_ids.shape)
+                print("latent_ids", latent_ids.shape)
 
                 # Predict the noise residual
                 model_pred = transformer(
-                    hidden_states=packed_noisy_model_input,
+                    hidden_states=packed_latents_interp,
                     # YiYi notes: divide it by 1000 for now because we scale it by 1000 in the transforme rmodel (we should not keep it but I want to keep the inputs same for the model for testing)
                     timestep=timesteps / 1000,
                     guidance=guidance,
                     pooled_projections=pooled_prompt_embeds,
                     encoder_hidden_states=prompt_embeds,
                     txt_ids=text_ids,
-                    img_ids=latent_image_ids,
+                    img_ids=latent_ids,
                     return_dict=False,
                 )[0]
+                
                 model_pred = FluxPipeline._unpack_latents(
                     model_pred,
-                    height=int(model_input.shape[2] * vae_scale_factor / 2),
-                    width=int(model_input.shape[3] * vae_scale_factor / 2),
-                    vae_scale_factor=vae_scale_factor,
+                    height=int(img_latents.shape[2] * 16 / 2),
+                    width=int(img_latents.shape[3] * 16 / 2),
+                    vae_scale_factor=16,
                 )
 
                 # these weighting schemes use a uniform timestep sampling
@@ -1682,24 +1389,10 @@ def main(args):
                 # weighting = compute_loss_weighting_for_sd3(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
 
                 # flow matching loss
-                target = noise - model_input
+                target = prior_latents - img_latents
 
-                print("target", target.shape)
-                print("model_pred", model_pred.shape)
-
-                if args.with_prior_preservation:
-                    # Chunk the noise and model_pred into two parts and compute the loss on each part separately.
-                    model_pred, model_pred_prior = torch.chunk(model_pred, 2, dim=0)
-                    target, target_prior = torch.chunk(target, 2, dim=0)
-
-                    # Compute prior loss
-                    prior_loss = torch.mean(
-                        ((model_pred_prior.float() - target_prior.float()) ** 2).reshape(
-                            target_prior.shape[0], -1
-                        ),
-                        1,
-                    )
-                    prior_loss = prior_loss.mean()
+                print("prior_latents", prior_latents.shape)
+                print("img_latents", img_latents.shape)
 
                 # Compute regular loss.
                 loss = torch.mean(
@@ -1707,10 +1400,6 @@ def main(args):
                     1,
                 )
                 loss = loss.mean()
-
-                if args.with_prior_preservation:
-                    # Add the prior loss to the instance loss.
-                    loss = loss + args.prior_loss_weight * prior_loss
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -1765,9 +1454,6 @@ def main(args):
 
         if accelerator.is_main_process:
             if args.validation_prompt is not None and epoch % args.validation_epochs == 0:
-                # create pipeline
-                # if not args.train_text_encoder:
-                #     text_encoder_one, text_encoder_two = load_text_encoders(text_encoder_cls_one, text_encoder_cls_two)
                 pipeline = FluxPipeline.from_pretrained(
                     args.pretrained_model_name_or_path,
                     vae=vae,
@@ -1779,7 +1465,8 @@ def main(args):
                     torch_dtype=weight_dtype,
                 )
                 pipeline_args = {"prompt_embeds": validation_prompt_hidden_states, 
-                                 "pooled_prompt_embeds": validation_pooled_prompt_embeds,}
+                                 "pooled_prompt_embeds": validation_pooled_prompt_embeds,
+                                 "num_inference_steps": 10}
                 images = log_validation(
                     pipeline=pipeline,
                     args=args,
@@ -1788,7 +1475,6 @@ def main(args):
                     epoch=epoch,
                 )
                 if not args.train_text_encoder:
-                    # del text_encoder_one, text_encoder_two
                     torch.cuda.empty_cache()
                     gc.collect()
 
