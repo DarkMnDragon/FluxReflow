@@ -1,4 +1,4 @@
-export MODEL_NAME="black-forest-labs/FLUX.1-dev"
+export MODEL_NAME="/root/autodl-tmp/data/FLUX-dev"
 export INSTANCE_DIR="dog"
 export OUTPUT_DIR="/root/autodl-tmp/flux-lora-dreambooth"
 export CLASS_DIR="/root/autodl-tmp/data/dog-prior"
@@ -14,8 +14,8 @@ accelerate launch train_dreambooth_lora_flux.py \
   --instance_prompt="A high-resolution photo of sks dog" \
   --class_prompt="A high-resolution photo of a dog" \
   --resolution=512 \
-  --train_batch_size=1 \
-  --gradient_accumulation_steps=4 \
+  --train_batch_size=2 \
+  --gradient_accumulation_steps=2 \
   --learning_rate=1e-5 \
   --report_to="wandb" \
   --lr_scheduler="constant" \
@@ -25,5 +25,5 @@ accelerate launch train_dreambooth_lora_flux.py \
   --validation_epochs=30 \
   --num_class_images=200 \
   --seed="0" \
-  --rank=8
+  --rank=1024
   --push_to_hub

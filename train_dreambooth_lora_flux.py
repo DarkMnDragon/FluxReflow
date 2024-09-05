@@ -1000,13 +1000,6 @@ def encode_prompt(
 
 
 def main(args):
-    result = subprocess.run('bash -c "source /etc/network_turbo && env | grep proxy"', shell=True, capture_output=True, text=True)
-    output = result.stdout
-    for line in output.splitlines():
-        if '=' in line:
-            var, value = line.split('=', 1)
-            os.environ[var] = value
-
     os.environ['HF_HOME'] = '/root/autodl-tmp/cache/'
     os.environ['HF_HUB_CACHE'] = '/root/autodl-tmp/cache/hub/'
     os.environ['HF_DATASETS_CACHE'] = '/root/autodl-tmp/cache/datasets/'
@@ -1436,6 +1429,9 @@ def main(args):
                 prompt_embeds = torch.cat([prompt_embeds, class_prompt_hidden_states], dim=0)
                 pooled_prompt_embeds = torch.cat([pooled_prompt_embeds, class_pooled_prompt_embeds], dim=0)
                 text_ids = torch.cat([text_ids, class_text_ids], dim=0)
+            prompt_embeds = prompt_embeds.repeat(args.train_batch_size, 1, 1)
+            pooled_prompt_embeds = pooled_prompt_embeds.repeat(args.train_batch_size, 1)
+            text_ids = text_ids.repeat(args.train_batch_size, 1, 1)
         # if we're optimizing the text encoder (both if instance prompt is used for all images or custom prompts)
         # we need to tokenize and encode the batch prompts on all training steps
         else:
@@ -1604,7 +1600,7 @@ def main(args):
                             prompt=args.instance_prompt,
                         )
 
-                # Convert images to latent space
+                # Convert images to latent space, e.g. [B, 3, 512, 512] -> [B, 16, 64, 64]
                 model_input = vae.encode(pixel_values).latent_dist.sample()
                 model_input = (model_input - vae.config.shift_factor) * vae.config.scaling_factor
                 model_input = model_input.to(dtype=weight_dtype)
@@ -1637,6 +1633,7 @@ def main(args):
                 # Add noise according to flow matching.
                 # zt = (1 - texp) * x + texp * z1
                 sigmas = get_sigmas(timesteps, n_dim=model_input.ndim, dtype=model_input.dtype)
+                # print("sigmas", sigmas.shape, sigmas)
                 noisy_model_input = (1.0 - sigmas) * model_input + sigmas * noise
 
                 packed_noisy_model_input = FluxPipeline._pack_latents(
@@ -1658,6 +1655,8 @@ def main(args):
                 print("timesteps", timesteps)
                 print("t5 encoder_hidden_states", prompt_embeds.shape)
                 print("clip pooled_projections", pooled_prompt_embeds.shape)
+                print("text_ids", text_ids.shape)
+                print("latent_image_ids", latent_image_ids.shape)
 
                 # Predict the noise residual
                 model_pred = transformer(
@@ -1680,10 +1679,13 @@ def main(args):
 
                 # these weighting schemes use a uniform timestep sampling
                 # and instead post-weight the loss
-                weighting = compute_loss_weighting_for_sd3(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
+                # weighting = compute_loss_weighting_for_sd3(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
 
                 # flow matching loss
                 target = noise - model_input
+
+                print("target", target.shape)
+                print("model_pred", model_pred.shape)
 
                 if args.with_prior_preservation:
                     # Chunk the noise and model_pred into two parts and compute the loss on each part separately.
@@ -1692,7 +1694,7 @@ def main(args):
 
                     # Compute prior loss
                     prior_loss = torch.mean(
-                        (weighting.float() * (model_pred_prior.float() - target_prior.float()) ** 2).reshape(
+                        ((model_pred_prior.float() - target_prior.float()) ** 2).reshape(
                             target_prior.shape[0], -1
                         ),
                         1,
@@ -1701,7 +1703,7 @@ def main(args):
 
                 # Compute regular loss.
                 loss = torch.mean(
-                    (weighting.float() * (model_pred.float() - target.float()) ** 2).reshape(target.shape[0], -1),
+                    ((model_pred.float() - target.float()) ** 2).reshape(target.shape[0], -1),
                     1,
                 )
                 loss = loss.mean()
