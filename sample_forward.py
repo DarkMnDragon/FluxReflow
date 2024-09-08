@@ -6,8 +6,10 @@ from flux_utils import get_models, get_noise, get_schedule, decode_imgs
 from prompt_dataset import PromptDataset
 from diffusers import FluxPipeline
 from torch.utils.data import Dataset, DataLoader
+from pathlib import Path
 
 torch.backends.cuda.matmul.allow_tf32 = True
+
 
 def parse_args(input_args=None):
     parser = argparse.ArgumentParser(description="Simple example of a training script.")
@@ -34,7 +36,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="./",
+        default=".",
         help="Path to save the generated reflow pairs.",
     )
     parser.add_argument(
@@ -64,7 +66,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--generation_precision",
         type=str,
-        default=None,
+        default="bf16",
         choices=["no", "fp32", "fp16", "bf16"],
         help=(
             "Choose generation precision between fp32, fp16 and bf16 (bfloat16). Bf16 requires PyTorch >="
@@ -111,26 +113,34 @@ def main(args):
         vae=vae,
         transformer=transformer,
     )
-    pipeline.load_lora_weights(args.lora_name_or_path)
+    if args.lora_name_or_path is not None:
+        pipeline.load_lora_weights(args.lora_name_or_path)
     pipeline.to(weight_dtype).to("cuda")
-
-    num_samples = 0
 
     output_dir = Path(args.output_dir)
     output_prompt_dir = output_dir / "prompt"
-    output_z_0_dir = 
+    output_z_0_dir = output_dir / "z_0"
+    output_z_1_dir = output_dir / "z_1"
+    output_img_dir = output_dir / "imgs"
+
+    output_prompt_dir.mkdir(parents=True, exist_ok=True)
+    output_z_0_dir.mkdir(parents=True, exist_ok=True)
+    output_z_1_dir.mkdir(parents=True, exist_ok=True)
+    output_img_dir.mkdir(parents=True, exist_ok=True)
+
+    step = 0
 
     for epoch in range(args.num_epochs):
         print(f"Epoch {epoch + 1}/{args.num_epochs}")
         for batch in dataloader:
-            num_samples += 1
-            print(f"Generating sample {num_samples} / {args.num_epochs * dataset.__len__()}...")
+            step += 1
+            print(f"Generating sample {step} / {args.num_epochs * dataset.__len__()}...")
 
             prompt = batch["prompt"]
             (prompt_embeds,  # save
-            pooled_prompt_embeds,  # save
-            text_ids,
-            ) = pipeline.encode_prompt(
+             pooled_prompt_embeds,  # save
+             text_ids,
+             ) = pipeline.encode_prompt(
                 prompt=prompt,
                 prompt_2=prompt,
                 device=pipeline.device,
@@ -138,10 +148,10 @@ def main(args):
             )
 
             torch.save({
-                "prompt": prompt_templates[step % len(prompt_templates)],
+                "prompt": prompt,
                 "prompt_embeds": prompt_embeds.detach().clone().cpu(),
                 "pooled_prompt_embeds": pooled_prompt_embeds.detach().clone().cpu(),
-            }, f"/root/autodl-tmp/reflow/prompt/prompt_{step}.pt")
+            }, output_prompt_dir / f"prompt_{step}.pt")
 
             noise = get_noise(  # save, shape [num_samples, 16, resolution // 8, resolution // 8]
                 num_samples=1,
@@ -152,7 +162,7 @@ def main(args):
                 seed=step,
             )
 
-            torch.save(noise.detach().clone().cpu(), f"/root/autodl-tmp/reflow/z_0/z_0_{step}.pt")
+            torch.save(noise.detach().clone().cpu(), output_z_0_dir / f"z_0_{step}.pt")
 
             latent_image_ids = FluxPipeline._prepare_latent_image_ids(
                 noise.shape[0],
@@ -163,7 +173,7 @@ def main(args):
             )
 
             packed_latents = FluxPipeline._pack_latents(
-                # shape [num_samples, (resolution // 16 * resolution // 16), 16 * 2 * 2]
+                # [num_samples, (resolution // 16 * resolution // 16), 16 * 2 * 2]
                 noise,
                 batch_size=noise.shape[0],
                 num_channels_latents=noise.shape[1],
@@ -180,9 +190,10 @@ def main(args):
             with pipeline.progress_bar(total=args.num_inference_steps) as progress_bar:
                 for t_curr, t_prev in zip(timesteps[:-1], timesteps[1:]):
                     t_vec = torch.full((packed_latents.shape[0],), t_curr, dtype=packed_latents.dtype,
-                                    device=packed_latents.device)
-                    guidance_vec = torch.full((packed_latents.shape[0],), args.guidance_scale, device=packed_latents.device,
-                                            dtype=packed_latents.dtype)
+                                       device=packed_latents.device)
+                    guidance_vec = torch.full((packed_latents.shape[0],), args.guidance_scale,
+                                              device=packed_latents.device,
+                                              dtype=packed_latents.dtype)
                     pred = transformer(
                         hidden_states=packed_latents,
                         timestep=t_vec,
@@ -208,10 +219,10 @@ def main(args):
                 vae_scale_factor=pipeline.vae_scale_factor,
             )
 
-            torch.save(img_latents.detach().clone().cpu(), f"/root/autodl-tmp/reflow/z_1/z_1_{step}.pt")
+            torch.save(img_latents.detach().clone().cpu(), output_z_1_dir / f"z_1_{step}.pt")
 
             imgs = decode_imgs(img_latents, pipeline)[0]
-            imgs.save(f"/root/autodl-tmp/reflow/imgs/sample_{step}.png")
+            imgs.save(output_img_dir / f"img_{step}.png")
 
 
 if __name__ == "__main__":
