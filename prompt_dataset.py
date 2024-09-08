@@ -4,6 +4,7 @@ import random
 import json
 import os
 from torch.utils.data import Dataset
+from pathlib import Path
 
 class PromptDataset(Dataset):
     def __init__(self, prompt_list=None, file_path=None, key='prompts'):
