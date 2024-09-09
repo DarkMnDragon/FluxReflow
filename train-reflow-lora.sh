@@ -1,14 +1,10 @@
-export MODEL_NAME="/root/autodl-tmp/data/FLUX-dev"
-export INSTANCE_DIR="dog"
-export OUTPUT_DIR="/root/autodl-tmp/flux-reflow-lora"
+export MODEL_NAME="/root/autodl-tmp/FLUX-dev"
+export OUTPUT_DIR="/root/autodl-tmp/lora_ckpt/reflow-aqua"
 
 accelerate launch train_reflow_lora.py \
-  --pretrained_model_name_or_path=$MODEL_NAME  \
+  --pretrained_model_name_or_path=$MODEL_NAME \
   --output_dir=$OUTPUT_DIR \
-  --img_root="/root/autodl-tmp/reflow/imgs"\
-  --prompt_root="/root/autodl-tmp/reflow/prompt"\
-  --prior_latent_root="/root/autodl-tmp/reflow/z_0"\
-  --img_latent_root="/root/autodl-tmp/reflow/z_1"\
+  --reflow_data_dir="/root/autodl-tmp/data/reflow-aqua" \
   --mixed_precision="bf16" \
   --resolution=1024 \
   --train_batch_size=1 \
@@ -18,9 +14,9 @@ accelerate launch train_reflow_lora.py \
   --report_to="wandb" \
   --lr_scheduler="constant" \
   --lr_warmup_steps=0 \
-  --max_train_steps=2000 \
-  --validation_prompt="A photo of chihuahua dog running on the beach under the sunshine" \
+  --max_train_steps=5000 \
+  --validation_prompt="A painting of a person giving a ted talk on a TED stage with the TED logo, 'the speaker'. AQUACOLTOK " \
   --validation_epochs=1 \
   --seed="0" \
-  --rank=1024
+  --rank=256
   --push_to_hub

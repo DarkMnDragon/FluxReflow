@@ -158,10 +158,12 @@ Please adhere to the licensing terms as described [here](https://huggingface.co/
 
 def load_text_encoders(class_one, class_two):
     text_encoder_one = class_one.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder", revision=args.revision, variant=args.variant
+        args.pretrained_model_name_or_path, subfolder="text_encoder",
+        variant=args.variant
     )
     text_encoder_two = class_two.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="text_encoder_2", revision=args.revision, variant=args.variant
+        args.pretrained_model_name_or_path, subfolder="text_encoder_2",
+        variant=args.variant
     )
     return text_encoder_one, text_encoder_two
 
@@ -211,10 +213,10 @@ def log_validation(
 
 
 def import_model_class_from_model_name_or_path(
-    pretrained_model_name_or_path: str, revision: str, subfolder: str = "text_encoder"
+    pretrained_model_name_or_path: str, subfolder: str = "text_encoder"
 ):
     text_encoder_config = PretrainedConfig.from_pretrained(
-        pretrained_model_name_or_path, subfolder=subfolder, revision=revision
+        pretrained_model_name_or_path, subfolder=subfolder,
     )
     model_class = text_encoder_config.architectures[0]
     if model_class == "CLIPTextModel":
@@ -239,13 +241,6 @@ def parse_args(input_args=None):
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
-        "--revision",
-        type=str,
-        default=None,
-        required=False,
-        help="Revision of pretrained model identifier from huggingface.co/models.",
-    )
-    parser.add_argument(
         "--variant",
         type=str,
         default=None,
@@ -254,34 +249,12 @@ def parse_args(input_args=None):
 
     # ReflowDataset
     parser.add_argument(
-        "--img_root",
+        "--reflow_data_dir",
         type=str,
         default=None,
         required=True,
-        help="Path to the root folder containing the images.",
+        help="Path to the reflow dataset directory.",
     )
-    parser.add_argument(
-        "--prompt_root",
-        type=str,
-        default=None,
-        required=True,
-        help="Path to the root folder containing the prompts.",
-    )
-    parser.add_argument(
-        "--prior_latent_root",
-        type=str,
-        default=None,
-        required=True,
-        help="Path to the root folder containing the prior latents.",
-    )
-    parser.add_argument(
-        "--img_latent_root",
-        type=str,
-        default=None,
-        required=True,
-        help="Path to the root folder containing the image latents.",
-    )
-
 
     parser.add_argument(
         "--cache_dir",
@@ -598,17 +571,14 @@ class ReflowDataset(Dataset):
 
     def __init__(
         self,
-        img_root,
-        prompt_root,
-        prior_latent_root,
-        img_latent_root,
+        reflow_data_dir,
         size=1024,
     ):
         self.size = size # img size
-        self.img_root = Path(img_root)
-        self.prompt_root = Path(prompt_root)
-        self.prior_latent_root = Path(prior_latent_root)
-        self.img_latent_root = Path(img_latent_root)
+        self.img_root = Path(reflow_data_dir) / "imgs"
+        self.prompt_root = Path(reflow_data_dir) / "prompt"
+        self.prior_latent_root = Path(reflow_data_dir) / "z_0"
+        self.img_latent_root = Path(reflow_data_dir) / "z_1"
 
         self.img_paths = sorted(self.img_root.glob('*.png'))
         self.prompt_paths = sorted(self.prompt_root.glob('*.pt'))
@@ -880,36 +850,36 @@ def main(args):
     tokenizer_one = CLIPTokenizer.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="tokenizer",
-        revision=args.revision,
     )
     tokenizer_two = T5TokenizerFast.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="tokenizer_2",
-        revision=args.revision,
     )
 
     # import correct text encoder classes
     text_encoder_cls_one = import_model_class_from_model_name_or_path(
-        args.pretrained_model_name_or_path, args.revision
+        args.pretrained_model_name_or_path
     )
     text_encoder_cls_two = import_model_class_from_model_name_or_path(
-        args.pretrained_model_name_or_path, args.revision, subfolder="text_encoder_2"
+        args.pretrained_model_name_or_path, 
+        subfolder="text_encoder_2"
     )
 
     # Load scheduler and models
     noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="scheduler"
+        args.pretrained_model_name_or_path, 
+        subfolder="scheduler"
     )
     noise_scheduler_copy = copy.deepcopy(noise_scheduler)
     text_encoder_one, text_encoder_two = load_text_encoders(text_encoder_cls_one, text_encoder_cls_two)
     vae = AutoencoderKL.from_pretrained(
         args.pretrained_model_name_or_path,
         subfolder="vae",
-        revision=args.revision,
         variant=args.variant,
     )
     transformer = FluxTransformer2DModel.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="transformer", revision=args.revision, variant=args.variant
+        args.pretrained_model_name_or_path, subfolder="transformer", 
+        variant=args.variant
     )
 
     # We only train the additional adapter LoRA layers
@@ -1156,10 +1126,7 @@ def main(args):
 
     # Dataset and DataLoaders creation:
     train_dataset = ReflowDataset(
-        img_root=args.img_root,
-        prompt_root=args.prompt_root,
-        prior_latent_root=args.prior_latent_root,
-        img_latent_root=args.img_latent_root,
+        reflow_data_dir=args.reflow_data_dir,
         size=args.resolution,
     )
 
@@ -1231,7 +1198,7 @@ def main(args):
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
-        tracker_name = "dreambooth-flux-dev-lora"
+        tracker_name = "flux-reflow-lora"
         accelerator.init_trackers(tracker_name, config=vars(args))
 
     # Train!
@@ -1460,7 +1427,6 @@ def main(args):
                     text_encoder=None,
                     text_encoder_2=None,
                     transformer=accelerator.unwrap_model(transformer),
-                    revision=args.revision,
                     variant=args.variant,
                     torch_dtype=weight_dtype,
                 )
@@ -1501,7 +1467,6 @@ def main(args):
         # Load previous pipeline
         pipeline = FluxPipeline.from_pretrained(
             args.pretrained_model_name_or_path,
-            revision=args.revision,
             variant=args.variant,
             torch_dtype=weight_dtype,
         )
