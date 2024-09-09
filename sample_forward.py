@@ -152,7 +152,7 @@ def main(args):
                 "prompt": prompt,
                 "prompt_embeds": prompt_embeds.detach().clone().cpu(),
                 "pooled_prompt_embeds": pooled_prompt_embeds.detach().clone().cpu(),
-            }, output_prompt_dir / f"prompt_{step}.pt")
+            }, output_prompt_dir / f"prompt_{step:04d}.pt")
 
             noise = get_noise(  # save, shape [num_samples, 16, resolution // 8, resolution // 8]
                 num_samples=1,
@@ -163,7 +163,7 @@ def main(args):
                 seed=step,
             )
 
-            torch.save(noise.detach().clone().cpu(), output_z_0_dir / f"z_0_{step}.pt")
+            torch.save(noise.detach().clone().cpu(), output_z_0_dir / f"z_0_{step:04d}.pt")
 
             latent_image_ids = FluxPipeline._prepare_latent_image_ids(
                 noise.shape[0],
@@ -220,10 +220,10 @@ def main(args):
                 vae_scale_factor=pipeline.vae_scale_factor,
             )
 
-            torch.save(img_latents.detach().clone().cpu(), output_z_1_dir / f"z_1_{step}.pt")
+            torch.save(img_latents.detach().clone().cpu(), output_z_1_dir / f"z_1_{step:04d}.pt")
 
             imgs = decode_imgs(img_latents, vae, pipeline)[0]
-            imgs.save(output_img_dir / f"img_{step}.png")
+            imgs.save(output_img_dir / f"img_{step:04d}.png")
 
 
 if __name__ == "__main__":
