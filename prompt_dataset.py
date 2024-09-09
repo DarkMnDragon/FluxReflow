@@ -51,6 +51,8 @@ def generate_dog_prompts():
 
     return prompt_templates
 
-dataset = PromptDataset(file_path="/root/dreambooth_flux/aquacoltok.json")
+# dataset = PromptDataset(file_path="/root/dreambooth_flux/aquacoltok.json")
 
-print(dataset.__len__())
+# dataset = PromptDataset(prompt_list=prompt_list)
+
+# dataset.save_prompts_from_list("./", "aquacoltok_prompts_v2.json")

@@ -16,34 +16,32 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
-        default=None,
-        required=True,
+        default="/root/autodl-tmp/FLUX-dev",
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
         "--lora_name_or_path",
         type=str,
-        default=None,
+        default="/root/autodl-tmp/data/Flux_Aquarell_Watercolor_v2.safetensors",
         help="Path to LoRA ckpt",
     )
     parser.add_argument(
         "--prompt_path",
         type=str,
-        default=None,
-        required=True,
+        default="/root/dreambooth_flux/aquacoltok_prompts_v2.json",
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
-        default=".",
+        default="/root/autodl-tmp/data/reflow-aqua",
         help="Path to save the generated reflow pairs.",
     )
     parser.add_argument(
         "--num_epochs",
         type=int,
-        default=2,
-        helper="number of epochs to sample from prompt dataset",
+        default=1,
+        help="number of epochs to sample from prompt dataset",
     )
     parser.add_argument(
         "--resolution",
@@ -114,6 +112,7 @@ def main(args):
         transformer=transformer,
     )
     if args.lora_name_or_path is not None:
+        print("Loading LoRA weights from", args.lora_name_or_path)
         pipeline.load_lora_weights(args.lora_name_or_path)
     pipeline.to(weight_dtype).to("cuda")
 
@@ -135,12 +134,14 @@ def main(args):
         for batch in dataloader:
             step += 1
             print(f"Generating sample {step} / {args.num_epochs * dataset.__len__()}...")
+            print(f"Prompt: {batch['prompt']}")
 
             prompt = batch["prompt"]
-            (prompt_embeds,  # save
-             pooled_prompt_embeds,  # save
-             text_ids,
-             ) = pipeline.encode_prompt(
+            (
+                prompt_embeds,         # save
+                pooled_prompt_embeds,  # save
+                text_ids,
+            ) = pipeline.encode_prompt(
                 prompt=prompt,
                 prompt_2=prompt,
                 device=pipeline.device,
@@ -221,7 +222,7 @@ def main(args):
 
             torch.save(img_latents.detach().clone().cpu(), output_z_1_dir / f"z_1_{step}.pt")
 
-            imgs = decode_imgs(img_latents, pipeline)[0]
+            imgs = decode_imgs(img_latents, vae, pipeline)[0]
             imgs.save(output_img_dir / f"img_{step}.png")
 
 

@@ -22,7 +22,7 @@ def encode_imgs(imgs, vae, weight_dtype=torch.bfloat16):  # img, shape [B, C, H,
 
 
 @torch.inference_mode()
-def decode_imgs(latents, pipeline, vae):  # img latents, shape [B, 16, H//8, W//8]
+def decode_imgs(latents, vae, pipeline):  # img latents, shape [B, 16, H//8, W//8]
     imgs = (latents / vae.config.scaling_factor) + vae.config.shift_factor
     imgs = vae.decode(imgs)[0]
     imgs = pipeline.image_processor.postprocess(imgs, output_type="pil")
