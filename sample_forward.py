@@ -16,37 +16,43 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
-        default="/root/autodl-tmp/FLUX-dev",
+        default="black-forest-labs/FLUX.1-dev",
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
         "--lora_name_or_path",
         type=str,
-        default="/root/autodl-tmp/data/Flux_Aquarell_Watercolor_v2.safetensors",
+        default="multimodalart/flux-tarot-v1",
         help="Path to LoRA ckpt",
     )
     parser.add_argument(
         "--prompt_path",
         type=str,
-        default="/root/dreambooth_flux/aquacoltok_prompts_v2.json",
+        default="/root/dreambooth_flux/tarot_prompts.json",
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/root/autodl-tmp/data/reflow-aqua",
+        default="/root/autodl-tmp/data/tarot",
         help="Path to save the generated reflow pairs.",
     )
     parser.add_argument(
         "--num_epochs",
         type=int,
-        default=1,
+        default=3,
         help="number of epochs to sample from prompt dataset",
     )
     parser.add_argument(
-        "--resolution",
+        "--height",
         type=int,
         default=1024,
+        help="resolution of the generated images",
+    )
+    parser.add_argument(
+        "--width",
+        type=int,
+        default=768,
         help="resolution of the generated images",
     )
     parser.add_argument(
@@ -113,7 +119,7 @@ def main(args):
     )
     if args.lora_name_or_path is not None:
         print("Loading LoRA weights from", args.lora_name_or_path)
-        pipeline.load_lora_weights(args.lora_name_or_path)
+        pipeline.load_lora_weights(args.lora_name_or_path, weight_name='flux_tarot_v1_lora.safetensors')
     pipeline.to(weight_dtype).to("cuda")
 
     output_dir = Path(args.output_dir)
@@ -154,10 +160,10 @@ def main(args):
                 "pooled_prompt_embeds": pooled_prompt_embeds.detach().clone().cpu(),
             }, output_prompt_dir / f"prompt_{step:04d}.pt")
 
-            noise = get_noise(  # save, shape [num_samples, 16, resolution // 8, resolution // 8]
+            noise = get_noise(  # save, shape [num_samples, 16, height // 8, width // 8]
                 num_samples=1,
-                height=args.resolution,
-                width=args.resolution,
+                height=args.height,
+                width=args.width,
                 device="cuda",
                 dtype=weight_dtype,
                 seed=step,
@@ -174,7 +180,7 @@ def main(args):
             )
 
             packed_latents = FluxPipeline._pack_latents(
-                # [num_samples, (resolution // 16 * resolution // 16), 16 * 2 * 2]
+                # [num_samples, (height // 16 * width // 16), 16 * 2 * 2]
                 noise,
                 batch_size=noise.shape[0],
                 num_channels_latents=noise.shape[1],
@@ -184,7 +190,7 @@ def main(args):
 
             timesteps = timesteps = get_schedule(  # shape: [num_inference_steps]
                 num_steps=args.num_inference_steps,
-                image_seq_len=(args.resolution // 16) * (args.resolution // 16),  # vae // 8 and patchify // 2
+                image_seq_len=(args.height // 16) * (args.width // 16),  # vae // 8 and patchify // 2
                 shift=True,  # Set True for Flux-dev, False for Flux-schnell
             )
 
@@ -211,12 +217,12 @@ def main(args):
                     # imgs_pred_list.append(imgs_pred)
                     progress_bar.update()
 
-            assert noise.shape[2] * 8 == args.resolution and noise.shape[3] * 8 == args.resolution
+            assert noise.shape[2] * 8 == args.height and noise.shape[3] * 8 == args.width
             assert pipeline.vae_scale_factor == 16
-            img_latents = FluxPipeline._unpack_latents(  # save, shape [num_samples, 16, resolution//8, resolution//8]
+            img_latents = FluxPipeline._unpack_latents(  # save, shape [num_samples, 16, height//8, width//8]
                 packed_latents,
-                height=args.resolution,
-                width=args.resolution,
+                height=args.height,
+                width=args.width,
                 vae_scale_factor=pipeline.vae_scale_factor,
             )
 
