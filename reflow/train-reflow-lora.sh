@@ -1,10 +1,10 @@
 export MODEL_NAME="/root/autodl-tmp/FLUX-dev"
-export OUTPUT_DIR="/root/autodl-tmp/lora_ckpt/reflow-dev-various"
+export OUTPUT_DIR="/root/autodl-tmp/lora_ckpt/3reflow-dev-various"
 
 accelerate launch train_reflow_lora.py \
   --pretrained_model_name_or_path=$MODEL_NAME \
   --output_dir=$OUTPUT_DIR \
-  --reflow_data_dir="/root/autodl-tmp/data/reflow_dev_various_prompts" \
+  --reflow_data_dir="/root/autodl-tmp/data/2reflow_various_prompts" \
   --mixed_precision="bf16" \
   --resolution=1024 \
   --train_batch_size=1 \
