@@ -2,10 +2,10 @@ import torch
 import argparse
 
 from PIL import Image
-from reflow.flux_utils import get_models, get_noise, get_schedule, decode_imgs
-from reflow.prompt_dataset import PromptDataset
+from flux_utils import get_models, get_noise, get_schedule, decode_imgs
+from prompt_dataset import PromptDataset
 from diffusers import FluxPipeline
-from torch.utils.data import Dataset, DataLoader
+from torch.utils.data import DataLoader
 from pathlib import Path
 
 torch.backends.cuda.matmul.allow_tf32 = True
@@ -22,25 +22,25 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--lora_name_or_path",
         type=str,
-        default="multimodalart/flux-tarot-v1",
+        default=None,
         help="Path to LoRA ckpt",
     )
     parser.add_argument(
         "--prompt_path",
         type=str,
-        default="/root/dreambooth_flux/tarot_prompts.json",
+        default="/root/dreambooth_flux/prompts_data/gpt4o_various_prompts.json",
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/root/autodl-tmp/data/tarot",
+        default="/root/autodl-tmp/data/reflow_dev_gpt4o_various_prompts",
         help="Path to save the generated reflow pairs.",
     )
     parser.add_argument(
         "--num_epochs",
         type=int,
-        default=3,
+        default=1,
         help="number of epochs to sample from prompt dataset",
     )
     parser.add_argument(
@@ -52,7 +52,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--width",
         type=int,
-        default=768,
+        default=1024,
         help="resolution of the generated images",
     )
     parser.add_argument(
@@ -94,6 +94,7 @@ def main(args):
         weight_dtype = torch.float
     else:
         weight_dtype = torch.float16
+    print(f"Using {weight_dtype} for generation")
 
     dataset = PromptDataset(file_path=args.prompt_path)
     dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
@@ -120,6 +121,8 @@ def main(args):
     if args.lora_name_or_path is not None:
         print("Loading LoRA weights from", args.lora_name_or_path)
         pipeline.load_lora_weights(args.lora_name_or_path, weight_name='flux_tarot_v1_lora.safetensors')
+    else:
+        print("No LoRA weights loaded")
     pipeline.to(weight_dtype).to("cuda")
 
     output_dir = Path(args.output_dir)
