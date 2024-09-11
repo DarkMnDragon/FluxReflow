@@ -1432,7 +1432,7 @@ def main(args):
                 )
                 pipeline_args = {"prompt_embeds": validation_prompt_hidden_states, 
                                  "pooled_prompt_embeds": validation_pooled_prompt_embeds,
-                                 "num_inference_steps": 10}
+                                 "num_inference_steps": 8}
                 images = log_validation(
                     pipeline=pipeline,
                     args=args,
