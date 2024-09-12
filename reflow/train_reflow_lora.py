@@ -916,8 +916,30 @@ def main(args):
     transformer_lora_config = LoraConfig(
         r=args.rank,
         lora_alpha=args.rank,
-        init_lora_weights="gaussian",
-        target_modules=["to_k", "to_q", "to_v", "to_out.0"],
+        init_lora_weights="gaussian", # also try "default"
+        target_modules=["to_k", 
+                        "to_q", 
+                        "to_v", 
+                        "to_out.0",
+                        "add_k_proj",
+                        "add_q_proj",
+                        "add_v_proj",
+                        "to_add_out",
+                        "norm.linear",
+                        "proj_mlp",
+                        "proj_out",
+                        "ff.net.0.proj",
+                        "ff.net.2",
+                        "ff_context.net.0.proj",
+                        "ff_context.net.2",
+                        "norm1.linear",
+                        "norm1_context.linear",
+                        "norm.linear",
+                        "timestep_embedder.linear_1",
+                        "timestep_embedder.linear_2",
+                        "guidance_embedder.linear_1",
+                        "guidance_embedder.linear_2",
+                        ],
     )
     transformer.add_adapter(transformer_lora_config)
     if args.train_text_encoder:
@@ -1421,6 +1443,8 @@ def main(args):
 
         if accelerator.is_main_process:
             if args.validation_prompt is not None and epoch % args.validation_epochs == 0:
+                torch.cuda.empty_cache()
+                gc.collect()
                 pipeline = FluxPipeline.from_pretrained(
                     args.pretrained_model_name_or_path,
                     vae=vae,
@@ -1440,9 +1464,8 @@ def main(args):
                     pipeline_args=pipeline_args,
                     epoch=epoch,
                 )
-                if not args.train_text_encoder:
-                    torch.cuda.empty_cache()
-                    gc.collect()
+                torch.cuda.empty_cache()
+                gc.collect()
 
     # Save the lora layers
     accelerator.wait_for_everyone()
