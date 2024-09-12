@@ -32,8 +32,14 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--lora_name_or_path",
         type=str,
-        default=None,
+        default="/root/autodl-tmp/data/3rf-scratch.safetensors",
         help="Path to LoRA ckpt",
+    )
+    parser.add_argument(
+        "--output_img_dir",
+        type=str,
+        default="/root/autodl-tmp/samples/3rf-scratch",
+        help="Path to save the generated images.",
     )
     parser.add_argument(
         "--prompt_path",
@@ -42,10 +48,10 @@ def parse_args(input_args=None):
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
-        "--output_img_dir",
-        type=str,
-        default="/root/autodl-tmp/data/reflow_dev_gpt4o_various_prompts",
-        help="Path to save the generated images.",
+        "--num_epochs",
+        type=int,
+        default=1,
+        help="number of epochs",
     )
     parser.add_argument(
         "--height",
@@ -62,7 +68,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--num_inference_steps",
         type=int,
-        default=10,
+        default=28,
         help="number of inference steps",
     )
     parser.add_argument(
@@ -101,7 +107,7 @@ def main(args):
     print(f"Using {weight_dtype} for generation")
 
     dataset = PromptDataset(file_path=args.prompt_path)
-    dataloader = DataLoader(dataset, batch_size=1, shuffle=True)
+    dataloader = DataLoader(dataset, batch_size=1, shuffle=False)
 
     (
         scheduler,
@@ -124,12 +130,15 @@ def main(args):
     )
     if args.lora_name_or_path is not None:
         print("Loading LoRA weights from", args.lora_name_or_path)
-        pipeline.load_lora_weights(args.lora_name_or_path, weight_name='flux_tarot_v1_lora.safetensors')
+        pipeline.load_lora_weights(args.lora_name_or_path)
     else:
         print("No LoRA weights loaded")
     pipeline.to(weight_dtype).to("cuda")
 
     step = 0
+
+    output_img_dir = Path(args.output_img_dir)
+    output_img_dir.mkdir(parents=True, exist_ok=True)
 
     for epoch in range(args.num_epochs):
         print(f"Epoch {epoch + 1}/{args.num_epochs}")
@@ -213,7 +222,7 @@ def main(args):
             )
 
             imgs = decode_imgs(img_latents, vae, pipeline)[0]
-            imgs.save(args.output_img_dir / f"img_{step:04d}.png")
+            imgs.save(output_img_dir / f"img_{step:04d}.png")
 
 
 if __name__ == "__main__":
