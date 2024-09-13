@@ -44,6 +44,7 @@ from torchvision import transforms
 from torchvision.transforms.functional import crop
 from tqdm.auto import tqdm
 from transformers import CLIPTokenizer, PretrainedConfig, T5TokenizerFast
+from torch import Tensor
 
 import diffusers
 from diffusers import (
@@ -866,11 +867,6 @@ def main(args):
     )
 
     # Load scheduler and models
-    noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-        args.pretrained_model_name_or_path, 
-        subfolder="scheduler"
-    )
-    noise_scheduler_copy = copy.deepcopy(noise_scheduler)
     text_encoder_one, text_encoder_two = load_text_encoders(text_encoder_cls_one, text_encoder_cls_two)
     vae = AutoencoderKL.from_pretrained(
         args.pretrained_model_name_or_path,
@@ -1273,16 +1269,28 @@ def main(args):
         disable=not accelerator.is_local_main_process,
     )
 
-    def get_sigmas(timesteps, n_dim=4, dtype=torch.float32):
-        sigmas = noise_scheduler_copy.sigmas.to(device=accelerator.device, dtype=dtype)
-        schedule_timesteps = noise_scheduler_copy.timesteps.to(accelerator.device)
-        timesteps = timesteps.to(accelerator.device)
-        step_indices = [(schedule_timesteps == t).nonzero().item() for t in timesteps]
+    def time_shift(mu: float, sigma: float, t: Tensor):
+        return math.exp(mu) / (math.exp(mu) + (1 / t - 1) ** sigma)
 
-        sigma = sigmas[step_indices].flatten()
-        while len(sigma.shape) < n_dim:
-            sigma = sigma.unsqueeze(-1)
-        return sigma
+    def get_lin_function(
+        x1: float = 256, y1: float = 0.5, x2: float = 4096, y2: float = 1.15
+    ):
+        m = (y2 - y1) / (x2 - x1)
+        b = y1 - m * x1
+        return lambda x: m * x + b
+
+    def get_schedule(
+        num_steps: int,
+        image_seq_len: int,
+        base_shift: float = 0.5,
+        max_shift: float = 1.15,
+        shift: bool = True,
+    ) -> list[float]:
+        timesteps = torch.linspace(1, 0, num_steps + 1)
+        if shift:
+            mu = get_lin_function(y1=base_shift, y2=max_shift)(image_seq_len)
+            timesteps = time_shift(mu, 1.0, timesteps)
+        return timesteps.tolist()
 
     for epoch in range(first_epoch, args.num_train_epochs):
         transformer.train()
@@ -1313,23 +1321,23 @@ def main(args):
                     weight_dtype,
                 )
 
-                # Sample a random timestep for each image
-                # for weighting schemes where we sample timesteps non-uniformly
-                u = compute_density_for_timestep_sampling(
-                    weighting_scheme=args.weighting_scheme,
-                    batch_size=img_latents.shape[0],
-                    logit_mean=args.logit_mean,
-                    logit_std=args.logit_std,
-                    mode_scale=args.mode_scale,
-                )
-                indices = (u * noise_scheduler_copy.config.num_train_timesteps).long()
-                timesteps = noise_scheduler_copy.timesteps[indices].to(device=img_latents.device)
+                train_num_steps = torch.randint(1, 51, (1,)).item()
+                timesteps = get_schedule(
+                    num_steps=train_num_steps,
+                    image_seq_len=(img_latents.shape[2]//2) * (img_latents.shape[3]//2),
+                )[:-1] # remove last element 0
 
-                # Add noise according to flow matching.
-                # zt = (1 - texp) * x + texp * z1
-                sigmas = get_sigmas(timesteps, n_dim=img_latents.ndim, dtype=img_latents.dtype)
-                # print("sigmas", sigmas.shape, sigmas)
-                latents_interp = (1.0 - sigmas) * img_latents + sigmas * prior_latents
+                print(f"train_num_timesteps: {train_num_steps}")
+
+                t = torch.tensor(
+                    [timesteps[torch.randint(0, len(timesteps), (1,)).item()] for _ in range(img_latents.shape[0])],
+                    device=accelerator.device,
+                    dtype=weight_dtype
+                )
+
+                print("train at timesteps", t)
+
+                latents_interp = (1.0 - t[:, None, None, None]) * img_latents + t[:, None, None, None] * prior_latents
 
                 packed_latents_interp = FluxPipeline._pack_latents(  # [B, (H//8*W//8), 16*2*2]
                     latents_interp,
@@ -1346,8 +1354,8 @@ def main(args):
                 else:
                     guidance = None
 
+                print("img_latents shape", img_latents.shape)
                 print("packed_latents_interp", packed_latents_interp.shape)
-                print("timesteps", timesteps)
                 print("t5 encoder_hidden_states", prompt_embeds.shape)
                 print("clip pooled_projections", pooled_prompt_embeds.shape)
                 print("text_ids", text_ids.shape)
@@ -1356,8 +1364,8 @@ def main(args):
                 # Predict the noise residual
                 model_pred = transformer(
                     hidden_states=packed_latents_interp,
-                    # YiYi notes: divide it by 1000 for now because we scale it by 1000 in the transforme rmodel (we should not keep it but I want to keep the inputs same for the model for testing)
-                    timestep=timesteps / 1000,
+                    # No need to divide by 1000 
+                    timestep=t,
                     guidance=guidance,
                     pooled_projections=pooled_prompt_embeds,
                     encoder_hidden_states=prompt_embeds,
