@@ -257,6 +257,14 @@ def parse_args(input_args=None):
         help="Path to the reflow dataset directory.",
     )
 
+    # (k-1) rf ckpt path
+    parser.add_argument(
+        "--rf_lora_ckpt_path",
+        type=str,
+        default=None,
+        help="Path to the (k-1) rf ckpt.",
+    )
+
     parser.add_argument(
         "--cache_dir",
         type=str,
@@ -938,6 +946,28 @@ def main(args):
                         ],
     )
     transformer.add_adapter(transformer_lora_config)
+
+    # Load pretrained (k-1) rf ckpt
+    def load_pretrained_rf(transformer, ckpt_path):
+        lora_state_dict = FluxPipeline.lora_state_dict(ckpt_path)
+        transformer_state_dict = {
+            f'{k.replace("transformer.", "")}': v for k, v in lora_state_dict.items() if k.startswith("transformer.")
+        }
+        transformer_state_dict = convert_unet_state_dict_to_peft(transformer_state_dict)
+        incompatible_keys = set_peft_model_state_dict(transformer, transformer_state_dict, adapter_name="default")
+        if incompatible_keys is not None:
+            # check only for unexpected keys
+            unexpected_keys = getattr(incompatible_keys, "unexpected_keys", None)
+            if unexpected_keys:
+                print(
+                    f"Loading loaded pretrained (k-1) rf from {ckpt_path} led to unexpected keys not found in the model: "
+                    f" {unexpected_keys}. "
+                )
+        else: 
+            print("Successfully loaded pretrained (k-1) rf")
+    if args.rf_lora_ckpt_path:
+        load_pretrained_rf(transformer, args.rf_lora_ckpt_path)
+
     if args.train_text_encoder:
         text_lora_config = LoraConfig(
             r=args.rank,
@@ -1040,6 +1070,9 @@ def main(args):
         cast_training_params(models, dtype=torch.float32)
 
     transformer_lora_parameters = list(filter(lambda p: p.requires_grad, transformer.parameters()))
+    num_trainable_params = sum(p.numel() for p in transformer_lora_parameters)
+    print(f"Number of trainable parameters in transformer LoRA: {num_trainable_params}")
+
     if args.train_text_encoder:
         text_lora_parameters_one = list(filter(lambda p: p.requires_grad, text_encoder_one.parameters()))
 
