@@ -963,9 +963,9 @@ def main(args):
                     f"Loading loaded pretrained (k-1) rf from {ckpt_path} led to unexpected keys not found in the model: "
                     f" {unexpected_keys}. "
                 )
-        else: 
-            print("Successfully loaded pretrained (k-1) rf")
-    if args.rf_lora_ckpt_path:
+            else: 
+                print("Successfully loaded pretrained (k-1) rf")
+    if args.rf_lora_ckpt_path is not None:
         load_pretrained_rf(transformer, args.rf_lora_ckpt_path)
 
     if args.train_text_encoder:

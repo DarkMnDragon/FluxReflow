@@ -1,10 +1,11 @@
 export MODEL_NAME="/root/autodl-tmp/FLUX-dev"
-export OUTPUT_DIR="/root/autodl-tmp/lora_ckpt/3reflow-dev-various"
+export OUTPUT_DIR="/root/autodl-tmp/lora_ckpt/3rf-various"
 
 accelerate launch train_reflow_lora.py \
   --pretrained_model_name_or_path=$MODEL_NAME \
   --output_dir=$OUTPUT_DIR \
-  --reflow_data_dir="/root/autodl-tmp/data/2reflow_various_prompts" \
+  --reflow_data_dir="/root/autodl-tmp/data/2rf_various_prompts_gpt4o" \
+  --rf_lora_ckpt_path="/root/autodl-tmp/data/2rf-various_prompts_4o.safetensors" \
   --mixed_precision="bf16" \
   --resolution=1024 \
   --train_batch_size=1 \
@@ -21,5 +22,5 @@ c, dense fog, creating an epic and dramatic mood. This hyper-realistic portrait 
 ents, blending fantasy and horror in a visually stunning way." \
   --validation_epochs=1 \
   --seed="0" \
-  --rank=256
+  --rank=128
   --push_to_hub
