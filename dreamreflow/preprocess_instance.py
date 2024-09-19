@@ -9,13 +9,13 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--instance_dir",
         type=str,
-        default="/instance",
+        default="/root/dreambooth_flux/dreamreflow/dog",
         help="Path to the directory containing the instance images.",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/img",
+        default="/root/autodl-tmp/data/dog-instance",
         help="Path to save the processed images.",
     )
 
@@ -27,10 +27,9 @@ def parse_args(input_args=None):
     return args
 
 def main(args):
-    
-    instance_dir = '/instance'
-    img_dir = '/img'
-    template_json_path = 'instance_prompts.json'
+    instance_dir = Path(args.instance_dir)
+    img_dir = Path(args.output_dir) / 'img'
+    template_json_path = Path(args.output_dir) / 'instance_prompts.json'
     resolution = 1024
 
     os.makedirs(img_dir, exist_ok=True)
