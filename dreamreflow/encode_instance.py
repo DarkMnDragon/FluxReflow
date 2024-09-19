@@ -58,7 +58,7 @@ def main(args):
 
     img_dir = output_dir / 'img'
     prompt_dir = output_dir / 'prompt'
-    z1_dir = output_dir / 'z1'
+    z1_dir = output_dir / 'z_1'
     template_json_path = output_dir / 'instance_prompts.json'
 
     os.makedirs(prompt_dir, exist_ok=True)

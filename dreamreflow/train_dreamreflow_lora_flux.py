@@ -616,7 +616,7 @@ class DreamBoosterDataset(Dataset):
                     print(f"Warning: Filename {filename} does not match pattern for key '{key}'")
                 
         common_ids = set.intersection(*(set(files_dict[key].keys()) for key in files_dict))
-        print(f"Found {len(common_ids)} common IDs in all keys.")
+        print(f"Found {len(common_ids)} common IDs in {roots}")
         
         data_list = []
         for file_id in sorted(common_ids):
@@ -624,8 +624,6 @@ class DreamBoosterDataset(Dataset):
             for key in roots:
                 data_item[key] = files_dict[key][file_id]
             data_list.append(data_item)
-        
-        print(data_list)
         
         return data_list
     
@@ -1123,6 +1121,31 @@ def main(args):
             eps=args.adam_epsilon,
         )
 
+    if args.optimizer.lower() == "prodigy":
+        try:
+            import prodigyopt
+        except ImportError:
+            raise ImportError("To use Prodigy, please install the prodigyopt library: `pip install prodigyopt`")
+
+        optimizer_class = prodigyopt.Prodigy
+
+        if args.learning_rate <= 0.1:
+            logger.warning(
+                "Learning rate is too low. When using prodigy, it's generally better to set learning rate around 1.0"
+            )
+
+        optimizer = optimizer_class(
+            params_to_optimize,
+            lr=args.learning_rate,
+            betas=(args.adam_beta1, args.adam_beta2),
+            beta3=args.prodigy_beta3,
+            weight_decay=args.adam_weight_decay,
+            eps=args.adam_epsilon,
+            decouple=args.prodigy_decouple,
+            use_bias_correction=args.prodigy_use_bias_correction,
+            safeguard_warmup=args.prodigy_safeguard_warmup,
+        )
+
     tokenizers = [tokenizer_one, tokenizer_two]
     text_encoders = [text_encoder_one, text_encoder_two]
 
@@ -1279,91 +1302,82 @@ def main(args):
         for step, batch in enumerate(train_dataloader):
             models_to_accumulate = [transformer]
             with accelerator.accumulate(models_to_accumulate):
-                # dict_keys(['prior_img', 'prior_prompt', 'prior_prompt_embeds', 'prior_pooled_prompt_embeds', 
-                # 'prior_latent', 'prior_gaussian', 'instance_img', 'instance_prompt', 'instance_prompt_embeds', 
-                # 'instance_pooled_prompt_embeds', 'instance_latent'])
+                train_num_steps = torch.randint(1, 51, (1,)).item()
+                print(f"train_num_timesteps: {train_num_steps}")
                 
-                # handle latents
-                prior_latent = batch["prior_latent"].to(dtype=weight_dtype)
-                instance_latent = batch["instance_latent"].to(dtype=weight_dtype)
-                prior_gaussian = batch["prior_gaussian"].to(dtype=weight_dtype) 
-                instance_gaussian = torch.randn_like(prior_gaussian)
-
-                latents = torch.cat([prior_latent, instance_latent], dim=0)       # [2*B, 16, H//8, W//8]
-                gaussians = torch.cat([prior_gaussian, instance_gaussian], dim=0) # [2*B, 16, H//8, W//8]
+                if step % 2 == 0: # prior loss
+                    prompt_embeds = batch["prior_prompt_embeds"].to(dtype=weight_dtype)
+                    pooled_prompt_embeds = batch["prior_pooled_prompt_embeds"].to(dtype=weight_dtype)
+                    latent = batch["prior_latent"].to(dtype=weight_dtype)
+                    gaussian = batch["prior_gaussian"].to(dtype=weight_dtype) 
+                    shifted_timesteps = get_schedule(
+                        num_steps=train_num_steps,
+                        image_seq_len=(latent.shape[2]//2) * (latent.shape[3]//2),
+                        shift=True,
+                    )[:-1]
+                    t = torch.tensor(
+                        [shifted_timesteps[torch.randint(0, len(shifted_timesteps), (1,)).item()] for _ in range(latent.shape[0])],
+                        device=accelerator.device,
+                        dtype=weight_dtype
+                    )
+                    loss_scale = args.prior_loss_weight
+                    print("prior_latent", latent.shape, "prior_gaussian", gaussian.shape)
+                    print("prior train at t", t)
+                else: # instance loss
+                    prompt_embeds = batch["instance_prompt_embeds"].to(dtype=weight_dtype)
+                    pooled_prompt_embeds = batch["instance_pooled_prompt_embeds"].to(dtype=weight_dtype)
+                    latent = batch["instance_latent"].to(dtype=weight_dtype)
+                    gaussian = torch.randn_like(latent)
+                    uniform_timesteps = get_schedule(
+                        num_steps=train_num_steps,
+                        image_seq_len=(latent.shape[2]//2) * (latent.shape[3]//2),
+                        shift=False,
+                    )[:-1]
+                    t = torch.tensor(
+                        [uniform_timesteps[torch.randint(0, len(uniform_timesteps), (1,)).item()] for _ in range(latent.shape[0])],
+                        device=accelerator.device,
+                        dtype=weight_dtype
+                    )
+                    loss_scale = 1.0
+                    print("instance_latent", latent.shape, "instance_gaussian", gaussian.shape)
+                    print("instance train at t", t)
 
                 latent_image_ids = FluxPipeline._prepare_latent_image_ids(
-                    latents.shape[0],
-                    latents.shape[2],
-                    latents.shape[3],
-                    accelerator.device,
-                    weight_dtype,
-                )
-                
-                train_num_steps = torch.randint(1, 51, (1,)).item()
-                shifted_timesteps = get_schedule(
-                    num_steps=train_num_steps,
-                    image_seq_len=(latents.shape[2]//2) * (latents.shape[3]//2),
-                    shift=True,
-                )[:-1]
-                uniform_timesteps = get_schedule(
-                    num_steps=train_num_steps,
-                    image_seq_len=(latents.shape[2]//2) * (latents.shape[3]//2),
-                    shift=False,
-                )[:-1]
-                print(f"train_num_timesteps: {train_num_steps}")
-                prior_t = torch.tensor(
-                    [shifted_timesteps[torch.randint(0, len(shifted_timesteps), (1,)).item()] for _ in range(prior_latent.shape[0])],
-                    device=accelerator.device,
-                    dtype=weight_dtype
-                )
-                instance_t = torch.tensor(
-                    [uniform_timesteps[torch.randint(0, len(uniform_timesteps), (1,)).item()] for _ in range(instance_latent.shape[0])],
-                    device=accelerator.device,
-                    dtype=weight_dtype
-                )
-                t = torch.cat([prior_t, instance_t], dim=0)
-                print("train at timesteps", t)
+                        latent.shape[0],
+                        latent.shape[2],
+                        latent.shape[3],
+                        accelerator.device,
+                        weight_dtype,
+                    )
 
-                noisy_latents = (1. - t[:, None, None, None]) * latents + t[:, None, None, None] * gaussians
-
-                packed_noisy_latents_input = FluxPipeline._pack_latents(
-                    noisy_latents,
-                    batch_size=latents.shape[0],
-                    num_channels_latents=latents.shape[1],
-                    height=latents.shape[2],
-                    width=latents.shape[3],
-                )
-
-                # handle prompt
-                prior_prompt_embeds = batch["prior_prompt_embeds"].to(dtype=weight_dtype)
-                prior_pooled_prompt_embeds = batch["prior_pooled_prompt_embeds"].to(dtype=weight_dtype)
-                instance_prompt_embeds = batch["instance_prompt_embeds"].to(dtype=weight_dtype)
-                instance_pooled_prompt_embeds = batch["instance_pooled_prompt_embeds"].to(dtype=weight_dtype)
-                prompt_embeds = torch.cat([prior_prompt_embeds, instance_prompt_embeds], dim=0)
-                pooled_prompt_embeds = torch.cat([prior_pooled_prompt_embeds, instance_pooled_prompt_embeds], dim=0)
                 text_ids = torch.zeros(prompt_embeds.shape[0], prompt_embeds.shape[1], 3,
-                                       device=prompt_embeds.device, dtype=weight_dtype)
+                                    device=prompt_embeds.device, dtype=weight_dtype)
+                    
+                noisy_latent = (1. - t[:, None, None, None]) * latent + t[:, None, None, None] * gaussian
 
-                # handle guidance
+                packed_noisy_latent_input = FluxPipeline._pack_latents(
+                    noisy_latent,
+                    batch_size=latent.shape[0],
+                    num_channels_latents=latent.shape[1],
+                    height=latent.shape[2],
+                    width=latent.shape[3],
+                )
+
                 if transformer.config.guidance_embeds:
                     guidance = torch.tensor([args.guidance_scale], device=accelerator.device)
-                    guidance = guidance.expand(packed_noisy_latents_input .shape[0])
+                    guidance = guidance.expand(packed_noisy_latent_input.shape[0])
                 else:
                     guidance = None
 
-                print("latents", latents.shape, "gaussians", gaussians.shape)
-                print("packed_noisy_latents_input", packed_noisy_latents_input.shape)
+                print("packed_noisy_latents_input", packed_noisy_latent_input.shape)
                 print("t5 encoder_hidden_states", prompt_embeds.shape)
                 print("clip pooled_projections", pooled_prompt_embeds.shape)
                 print("text_ids", text_ids.shape)
-                print("latent_ids", latent_image_ids.shape)
+                print("latent_image_ids", latent_image_ids.shape)
 
-                # Predict velocity
                 model_pred = transformer(
-                    hidden_states=packed_noisy_latents_input,
-                    # No need to divide by 1000 here
-                    timestep=t,
+                    hidden_states=packed_noisy_latent_input,
+                    timestep=t, # No need to divide by 1000 here
                     guidance=guidance,
                     pooled_projections=pooled_prompt_embeds,
                     encoder_hidden_states=prompt_embeds,
@@ -1374,27 +1388,17 @@ def main(args):
 
                 model_pred = FluxPipeline._unpack_latents(
                     model_pred,
-                    height=int(latents.shape[2] * 16 / 2),
-                    width=int(latents.shape[3] * 16 / 2),
+                    height=int(noisy_latent.shape[2] * 16 / 2),
+                    width=int(noisy_latent.shape[3] * 16 / 2),
                     vae_scale_factor=16,
                 )
 
-                # these weighting schemes use a uniform timestep sampling
-                # and instead post-weight the loss
-                # weighting = compute_loss_weighting_for_sd3(weighting_scheme=args.weighting_scheme, sigmas=sigmas)
-
-                # flow matching loss
-                target = gaussians - latents
-
-                model_pred_prior, model_pred_instance = torch.chunk(model_pred, 2, dim=0)
-                target_prior, target_instance = torch.chunk(target, 2, dim=0)
-
-                # Compute prior & instance loss
-                prior_loss = torch.mean((model_pred_prior.float() - target_prior.float()) ** 2)
-                instance_loss = torch.mean((model_pred_instance.float() - target_instance.float()) ** 2)
-                print("prior_loss", prior_loss, "instance_loss", instance_loss)
-
-                loss = instance_loss + args.prior_loss_weight * prior_loss
+                # Rectified Flow loss
+                target = gaussian - latent
+                # Compute prior or instance loss
+                loss = torch.mean((model_pred.float() - target.float()) ** 2)
+                loss = loss_scale * loss
+                print(f"loss scale: {loss_scale}, loss: {loss}")
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
