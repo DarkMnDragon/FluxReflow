@@ -16,7 +16,7 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
-        default="black-forest-labs/FLUX.1-dev",
+        default="/root/autodl-tmp/FLUX-dev",
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
@@ -28,13 +28,13 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--prompt_path",
         type=str,
-        default="/root/dreambooth_flux/prompts_data/gpt4o_various_prompts.json",
+        default="/root/dreambooth_flux/prompts_data/dog_prior_prompt.json",
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/root/autodl-tmp/data/reflow_dev_gpt4o_various_prompts",
+        default="/root/autodl-tmp/data/1rf-dog",
         help="Path to save the generated reflow pairs.",
     )
     parser.add_argument(

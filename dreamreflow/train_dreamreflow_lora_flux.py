@@ -85,7 +85,6 @@ def save_model_card(
     repo_id: str,
     images=None,
     base_model: str = None,
-    train_text_encoder=False,
     instance_prompt=None,
     validation_prompt=None,
     repo_folder=None,
@@ -109,7 +108,6 @@ These are {repo_id} DreamBooth LoRA weights for {base_model}.
 
 The weights were trained using [DreamBooth](https://dreambooth.github.io/) with the [Flux diffusers trainer](https://github.com/huggingface/diffusers/blob/main/examples/dreambooth/README_flux.md).
 
-Was LoRA for the text encoder enabled? {train_text_encoder}.
 
 ## Trigger words
 
@@ -213,7 +211,7 @@ def log_validation(
 
 
 def import_model_class_from_model_name_or_path(
-    pretrained_model_name_or_path: str, revision: str, subfolder: str = "text_encoder"
+    pretrained_model_name_or_path: str, subfolder: str = "text_encoder"
 ):
     text_encoder_config = PretrainedConfig.from_pretrained(
         pretrained_model_name_or_path, subfolder=subfolder,
@@ -260,6 +258,12 @@ def parse_args(input_args=None):
         default=None,
         required=True,
         help="The root directory of the instance dataset.",
+    )
+    parser.add_argument(
+        "--pretrained_lora_path",
+        type=str,
+        default=None,
+        help="Path to pretrained LoRA model.",
     )
     parser.add_argument(
         "--cache_dir",
@@ -546,12 +550,6 @@ def parse_args(input_args=None):
         args = parser.parse_args(input_args)
     else:
         args = parser.parse_args()
-
-    if args.dataset_name is None and args.instance_data_dir is None:
-        raise ValueError("Specify either `--dataset_name` or `--instance_data_dir`")
-
-    if args.dataset_name is not None and args.instance_data_dir is not None:
-        raise ValueError("Specify only one of `--dataset_name` or `--instance_data_dir`")
 
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -1394,16 +1392,13 @@ def main(args):
                 # Compute prior & instance loss
                 prior_loss = torch.mean((model_pred_prior.float() - target_prior.float()) ** 2)
                 instance_loss = torch.mean((model_pred_instance.float() - target_instance.float()) ** 2)
+                print("prior_loss", prior_loss, "instance_loss", instance_loss)
 
                 loss = instance_loss + args.prior_loss_weight * prior_loss
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
-                    params_to_clip = (
-                        itertools.chain(transformer.parameters(), text_encoder_one.parameters())
-                        if args.train_text_encoder
-                        else transformer.parameters()
-                    )
+                    params_to_clip = (transformer.parameters())
                     accelerator.clip_grad_norm_(params_to_clip, args.max_grad_norm)
 
                 optimizer.step()
@@ -1481,11 +1476,7 @@ def main(args):
         transformer = transformer.to(torch.float32)
         transformer_lora_layers = get_peft_model_state_dict(transformer)
 
-        if args.train_text_encoder:
-            text_encoder_one = unwrap_model(text_encoder_one)
-            text_encoder_lora_layers = get_peft_model_state_dict(text_encoder_one.to(torch.float32))
-        else:
-            text_encoder_lora_layers = None
+        text_encoder_lora_layers = None
 
         FluxPipeline.save_lora_weights(
             save_directory=args.output_dir,
@@ -1521,7 +1512,6 @@ def main(args):
                 repo_id,
                 images=images,
                 base_model=args.pretrained_model_name_or_path,
-                train_text_encoder=args.train_text_encoder,
                 instance_prompt=args.instance_prompt,
                 validation_prompt=args.validation_prompt,
                 repo_folder=args.output_dir,
