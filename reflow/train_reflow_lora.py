@@ -247,7 +247,13 @@ def parse_args(input_args=None):
         default=None,
         help="Variant of the model files of the pretrained model identifier from huggingface.co/models, 'e.g.' fp16",
     )
-
+    # LoRA warm-up
+    parser.add_argument(
+        "--lora_warmup_steps",
+        type=int,
+        default=0,
+        help="Number of steps for the LoRA warm-up.",
+    )
     # ReflowDataset
     parser.add_argument(
         "--reflow_data_dir",
@@ -584,7 +590,7 @@ class ReflowDataset(Dataset):
         size=1024,
     ):
         self.size = size # img size
-        self.img_root = Path(reflow_data_dir) / "imgs"
+        self.img_root = Path(reflow_data_dir) / "img"
         self.prompt_root = Path(reflow_data_dir) / "prompt"
         self.prior_latent_root = Path(reflow_data_dir) / "z_0"
         self.img_latent_root = Path(reflow_data_dir) / "z_1"
@@ -1344,8 +1350,14 @@ def main(args):
                 text_ids = torch.zeros(prompt_embeds.shape[0], prompt_embeds.shape[1], 3,
                                        device=prompt_embeds.device, dtype=weight_dtype)
 
-                img_latents = batch["img_latents"].to(dtype=weight_dtype)     # [B, 16, H//8, W//8]
-                prior_latents = batch["prior_latents"].to(dtype=weight_dtype) # [B, 16, H//8, W//8]
+                img_latents = batch["img_latents"].to(dtype=weight_dtype)         # [B, 16, H//8, W//8]
+                if step < args.lora_warmup_steps:
+                    prior_latents = torch.randn_like(img_latents)
+                    shift_time_dist = False
+                else: 
+                    prior_latents = batch["prior_latents"].to(dtype=weight_dtype) # [B, 16, H//8, W//8]
+                    shift_time_dist = True
+
                 latent_ids = FluxPipeline._prepare_latent_image_ids(
                     img_latents.shape[0],
                     img_latents.shape[2],
@@ -1358,9 +1370,10 @@ def main(args):
                 timesteps = get_schedule(
                     num_steps=train_num_steps,
                     image_seq_len=(img_latents.shape[2]//2) * (img_latents.shape[3]//2),
+                    shift=shift_time_dist
                 )[:-1] # remove last element 0
 
-                print(f"train_num_timesteps: {train_num_steps}")
+                print(f"train_num_timesteps: {train_num_steps}, shift_time_dist: {shift_time_dist}")
 
                 t = torch.tensor(
                     [timesteps[torch.randint(0, len(timesteps), (1,)).item()] for _ in range(img_latents.shape[0])],
@@ -1372,7 +1385,7 @@ def main(args):
 
                 latents_interp = (1.0 - t[:, None, None, None]) * img_latents + t[:, None, None, None] * prior_latents
 
-                packed_latents_interp = FluxPipeline._pack_latents(  # [B, (H//8*W//8), 16*2*2]
+                packed_latents_interp = FluxPipeline._pack_latents(  # [B, (H//8 * W//8), 16*2*2]
                     latents_interp,
                     batch_size=img_latents.shape[0],
                     num_channels_latents=img_latents.shape[1],
@@ -1397,8 +1410,7 @@ def main(args):
                 # Predict the noise residual
                 model_pred = transformer(
                     hidden_states=packed_latents_interp,
-                    # No need to divide by 1000 
-                    timestep=t,
+                    timestep=t, # No need to divide by 1000 
                     guidance=guidance,
                     pooled_projections=pooled_prompt_embeds,
                     encoder_hidden_states=prompt_embeds,
