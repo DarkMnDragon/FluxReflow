@@ -579,6 +579,7 @@ class DreamBoosterDataset(Dataset):
             "img": Path(instance_data_root) / "img",
             "prompt": Path(instance_data_root) / "prompt",
             "z_1": Path(instance_data_root) / "z_1",
+            "z_0": Path(instance_data_root) / "z_0",
         }
 
         self.prior_paths = self._get_data_paths(self.prior_roots)
@@ -1310,37 +1311,43 @@ def main(args):
                     pooled_prompt_embeds = batch["prior_pooled_prompt_embeds"].to(dtype=weight_dtype)
                     latent = batch["prior_latent"].to(dtype=weight_dtype)
                     gaussian = batch["prior_gaussian"].to(dtype=weight_dtype) 
-                    shifted_timesteps = get_schedule(
+                    timesteps = get_schedule(
                         num_steps=train_num_steps,
                         image_seq_len=(latent.shape[2]//2) * (latent.shape[3]//2),
                         shift=True,
                     )[:-1]
-                    t = torch.tensor(
-                        [shifted_timesteps[torch.randint(0, len(shifted_timesteps), (1,)).item()] for _ in range(latent.shape[0])],
-                        device=accelerator.device,
-                        dtype=weight_dtype
-                    )
                     loss_scale = args.prior_loss_weight
                     print("prior_latent", latent.shape, "prior_gaussian", gaussian.shape)
-                    print("prior train at t", t)
                 else: # instance loss
                     prompt_embeds = batch["instance_prompt_embeds"].to(dtype=weight_dtype)
                     pooled_prompt_embeds = batch["instance_pooled_prompt_embeds"].to(dtype=weight_dtype)
                     latent = batch["instance_latent"].to(dtype=weight_dtype)
-                    gaussian = torch.randn_like(latent)
-                    uniform_timesteps = get_schedule(
-                        num_steps=train_num_steps,
-                        image_seq_len=(latent.shape[2]//2) * (latent.shape[3]//2),
-                        shift=False,
-                    )[:-1]
-                    t = torch.tensor(
-                        [uniform_timesteps[torch.randint(0, len(uniform_timesteps), (1,)).item()] for _ in range(latent.shape[0])],
-                        device=accelerator.device,
-                        dtype=weight_dtype
-                    )
-                    loss_scale = 1.0
-                    print("instance_latent", latent.shape, "instance_gaussian", gaussian.shape)
-                    print("instance train at t", t)
+                    if step < 1500: # start up, learn concept
+                        gaussian = torch.randn_like(latent)
+                        timesteps = get_schedule(
+                            num_steps=train_num_steps,
+                            image_seq_len=(latent.shape[2]//2) * (latent.shape[3]//2),
+                            shift=False,
+                        )[:-1]
+                        loss_scale = 1.0
+                        print("Random instance_latent")
+                    else:
+                        gaussian = batch["instance_gaussian"].to(dtype=weight_dtype)
+                        timesteps = get_schedule(
+                            num_steps=train_num_steps,
+                            image_seq_len=(latent.shape[2]//2) * (latent.shape[3]//2),
+                            shift=True,
+                        )[:-1]
+                        loss_scale = args.prior_loss_weight
+                        print("Prior reversed instance_latent")
+                    print("instance_latent", latent.shape, "reversed instance_gaussian", gaussian.shape)
+
+                t = torch.tensor(
+                    [timesteps[torch.randint(0, len(timesteps), (1,)).item()] for _ in range(latent.shape[0])],
+                    device=accelerator.device,
+                    dtype=weight_dtype
+                )
+                print("train at t:", t)
 
                 latent_image_ids = FluxPipeline._prepare_latent_image_ids(
                         latent.shape[0],

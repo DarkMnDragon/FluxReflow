@@ -1,11 +1,10 @@
 export MODEL_NAME="/root/autodl-tmp/FLUX-dev"
-export OUTPUT_DIR="/root/autodl-tmp/lora_ckpt/3rf-various"
+export OUTPUT_DIR="/root/autodl-tmp/lora_ckpt/2rf-dog"
 
 accelerate launch train_reflow_lora.py \
   --pretrained_model_name_or_path=$MODEL_NAME \
   --output_dir=$OUTPUT_DIR \
-  --reflow_data_dir="/root/autodl-tmp/data/2rf_various_prompts_gpt4o" \
-  --rf_lora_ckpt_path="/root/autodl-tmp/data/2rf-various_prompts_4o.safetensors" \
+  --reflow_data_dir="/root/autodl-tmp/data/1rf-dog" \
   --mixed_precision="bf16" \
   --resolution=1024 \
   --train_batch_size=1 \
@@ -16,11 +15,8 @@ accelerate launch train_reflow_lora.py \
   --lr_scheduler="constant" \
   --lr_warmup_steps=0 \
   --max_train_steps=5000 \
-  --validation_prompt="A gothic queen vampiress with dark blue hair and crimson red eyes: Her sensuous white skin gleams in the atmospheri
-c, dense fog, creating an epic and dramatic mood. This hyper-realistic portrait is filled with morbid beauty, from her gothic
- attire to the intense lighting that highlights every intricate detail. The scene combines glamour with dark, mysterious elem
-ents, blending fantasy and horror in a visually stunning way." \
+  --validation_prompt="A photo of a dog running on a beach, high resolution, 4k" \
   --validation_epochs=1 \
   --seed="0" \
-  --rank=128
+  --rank=64
   --push_to_hub
