@@ -9,13 +9,13 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--instance_dir",
         type=str,
-        default="/instance",
+        default="/root/dreambooth_flux/dreamreflow/dog",
         help="Path to the directory containing the instance images.",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/img",
+        default="/root/autodl-tmp/data/dog-instance",
         help="Path to save the processed images.",
     )
 
@@ -27,10 +27,9 @@ def parse_args(input_args=None):
     return args
 
 def main(args):
-    
-    instance_dir = '/instance'
-    img_dir = '/img'
-    template_json_path = 'instance_prompts.json'
+    instance_dir = Path(args.instance_dir)
+    img_dir = Path(args.output_dir) / 'img'
+    template_json_path = Path(args.output_dir) / 'instance_prompts.json'
     resolution = 1024
 
     os.makedirs(img_dir, exist_ok=True)
@@ -38,25 +37,37 @@ def main(args):
     image_files = [f for f in os.listdir(instance_dir) if f.lower().endswith(('.png', '.jpg', '.jpeg'))]
     image_files.sort()
 
-    prompts_template = {}
+    if os.path.exists(template_json_path):
+        with open(template_json_path, 'r', encoding='utf-8') as json_file:
+            prompts_template = json.load(json_file)
+    else:
+        prompts_template = {}
 
     for idx, image_file in enumerate(image_files):
+        new_filename = f'img_{idx+1:05d}.png'
+
+        # Skip if the filename already exists in the JSON
+        if new_filename in prompts_template:
+            print(f"Skipping {new_filename} as it already exists in JSON.")
+            continue
+
         img_path = os.path.join(instance_dir, image_file)
         img = Image.open(img_path).convert('RGB')
 
         img_processed = resize_and_center_crop(img, (resolution, resolution))
 
-        new_filename = f'img_{idx+1:05d}.png'
         new_img_path = os.path.join(img_dir, new_filename)
         img_processed.save(new_img_path)
 
+        # Add new filename to JSON with an empty prompt
         prompts_template[new_filename] = ""
-        
+
+    # Save updated JSON file
     with open(template_json_path, 'w', encoding='utf-8') as json_file:
         json.dump(prompts_template, json_file, indent=4, ensure_ascii=False)
 
     print(f"Processed {len(image_files)} images and saved in '{img_dir}' directory.")
-    print(f"Created template JSON file '{template_json_path}', please fill in the corresponding prompts.")
+    print(f"Updated template JSON file '{template_json_path}', please fill in the corresponding prompts.")
 
 def resize_and_center_crop(img, target_size):
     original_width, original_height = img.size

@@ -19,13 +19,13 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--pretrained_model_name_or_path",
         type=str,
-        default="black-forest-labs/FLUX.1-dev",
+        default="/root/autodl-tmp/FLUX-dev",
         help="Path to pretrained model or model identifier from huggingface.co/models.",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="/root/autodl-tmp/data/reflow_dev_gpt4o_various_prompts",
+        default="/root/autodl-tmp/data/dog-instance",
         help="Path to save the generated reflow pairs.",
     )
     parser.add_argument(
@@ -52,12 +52,13 @@ def main(args):
     if args.generation_precision == "bf16": weight_dtype = torch.bfloat16
     elif args.generation_precision == "fp32": weight_dtype = torch.float
     else: weight_dtype = torch.float16
+    print(f"Using {weight_dtype} for model weights.")
 
     output_dir = Path(args.output_dir)
 
     img_dir = output_dir / 'img'
     prompt_dir = output_dir / 'prompt'
-    z1_dir = output_dir / 'z1'
+    z1_dir = output_dir / 'z_1'
     template_json_path = output_dir / 'instance_prompts.json'
 
     os.makedirs(prompt_dir, exist_ok=True)
@@ -119,7 +120,8 @@ def main(args):
         transformer=None,
     )
     pipeline.to(weight_dtype).to("cuda")
-
+    print("Successfully loaded pipeline.")
+    
     transform = transforms.Compose([
         transforms.ToTensor(),  
         transforms.Normalize([0.5], [0.5]),  
@@ -133,7 +135,7 @@ def main(args):
 
         img = Image.open(img_path).convert('RGB')
         img_tensor = transform(img)  # [C, H, W]
-        img_tensor = img_tensor.unsqueeze(0).to("cuda")  # [1, C, H, W]
+        img_tensor = img_tensor.unsqueeze(0).to("cuda").to(weight_dtype)  # [1, C, H, W]
 
         with torch.no_grad():
             img_latent = encode_imgs(img_tensor, pipeline.vae)  # [1, 16, H//8, W//8]
@@ -143,6 +145,9 @@ def main(args):
         torch.save(img_latent, z1_path)
 
         prompt = prompts[image_file]
+
+        print(f"Processing {image_file} with prompt: {prompt}")
+
         with torch.no_grad():
             (
                 prompt_embeds,         # save
