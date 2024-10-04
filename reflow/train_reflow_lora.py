@@ -291,6 +291,12 @@ def parse_args(input_args=None):
         help="A prompt that is used during validation to verify that the model is learning.",
     )
     parser.add_argument(
+        "--validation_inference_steps",
+        type=int,
+        default=8,
+        help="Number of inference steps to run during validation.",
+    )
+    parser.add_argument(
         "--num_validation_images",
         type=int,
         default=4,
@@ -1316,6 +1322,19 @@ def main(args):
             mu = get_lin_function(y1=base_shift, y2=max_shift)(image_seq_len)
             timesteps = time_shift(mu, 1.0, timesteps)
         return timesteps.tolist()
+    
+    def exponential_pdf(x, a):
+        C = a / (torch.exp(torch.tensor(a)) - 1)
+        return C * torch.exp(a * x)
+
+    def u_shaped_t(num_samples, alpha=2.):
+        alpha = torch.tensor(alpha, dtype=torch.float32)
+        u = torch.rand(num_samples)
+        t = -torch.log(1 - u * (1 - torch.exp(-alpha))) / alpha  # inverse cdf = torch.log(u * (torch.exp(torch.tensor(a)) - 1) / a) / a
+        t = torch.cat([t, 1 - t], dim=0)
+        t = t[torch.randperm(t.shape[0])]
+        t = t[:num_samples]
+        return t
 
     for epoch in range(first_epoch, args.num_train_epochs):
         transformer.train()
@@ -1337,7 +1356,7 @@ def main(args):
                                        device=prompt_embeds.device, dtype=weight_dtype)
 
                 img_latents = batch["img_latents"].to(dtype=weight_dtype)         # [B, 16, H//8, W//8]
-                if step < args.lora_warmup_steps:
+                if global_step < args.lora_warmup_steps:
                     prior_latents = torch.randn_like(img_latents)
                     shift_time_dist = False
                 else: 
@@ -1352,20 +1371,20 @@ def main(args):
                     weight_dtype,
                 )
 
-                train_num_steps = torch.randint(1, 51, (1,)).item()
-                timesteps = get_schedule(
-                    num_steps=train_num_steps,
-                    image_seq_len=(img_latents.shape[2]//2) * (img_latents.shape[3]//2),
-                    shift=shift_time_dist
-                )[:-1] # remove last element 0
+                # # train_num_steps = torch.randint(1, 16, (1,)).item()
+                # print(f"train_num_timesteps: {train_num_steps}, shift_time_dist: {shift_time_dist}")
+                # timesteps = get_schedule(
+                #     num_steps=train_num_steps,
+                #     image_seq_len=(img_latents.shape[2]//2) * (img_latents.shape[3]//2),
+                #     shift=shift_time_dist
+                # )[:-1] # remove last element 0
+                # t = torch.tensor(
+                #     [timesteps[torch.randint(0, len(timesteps), (1,)).item()] for _ in range(img_latents.shape[0])],
+                #     device=accelerator.device,
+                #     dtype=weight_dtype
+                # )
 
-                print(f"train_num_timesteps: {train_num_steps}, shift_time_dist: {shift_time_dist}")
-
-                t = torch.tensor(
-                    [timesteps[torch.randint(0, len(timesteps), (1,)).item()] for _ in range(img_latents.shape[0])],
-                    device=accelerator.device,
-                    dtype=weight_dtype
-                )
+                t = u_shaped_t(num_samples=img_latents.shape[0]).to(dtype=weight_dtype, device=img_latents.device)
 
                 print("train at timesteps", t)
 
@@ -1495,7 +1514,7 @@ def main(args):
                 )
                 pipeline_args = {"prompt_embeds": validation_prompt_hidden_states, 
                                  "pooled_prompt_embeds": validation_pooled_prompt_embeds,
-                                 "num_inference_steps": 8}
+                                 "num_inference_steps": args.validation_inference_steps}
                 images = log_validation(
                     pipeline=pipeline,
                     args=args,

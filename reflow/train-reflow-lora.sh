@@ -1,10 +1,10 @@
 export MODEL_NAME="/root/autodl-tmp/FLUX-dev"
-export OUTPUT_DIR="/root/autodl-tmp/lora_ckpt/2rf-tarot"
+export OUTPUT_DIR="/root/autodl-tmp/lora_ckpt/2rf-sights-u_shaped_t"
 
 accelerate launch train_reflow_lora.py \
   --pretrained_model_name_or_path=$MODEL_NAME \
   --output_dir=$OUTPUT_DIR \
-  --reflow_data_dir="/root/autodl-tmp/data/1rf_tarot" \
+  --reflow_data_dir="/root/autodl-tmp/data/1rf_sights" \
   --mixed_precision="bf16" \
   --resolution=1024 \
   --train_batch_size=1 \
@@ -14,10 +14,11 @@ accelerate launch train_reflow_lora.py \
   --report_to="wandb" \
   --lr_scheduler="constant" \
   --lr_warmup_steps=0 \
-  --max_train_steps=5000 \
-  --validation_prompt="a person giving a ted talk on a TED stage with the TED logo, 'the speaker' in the style of TOK a trtcrd, tarot style" \
-  --lora_warmup_steps=1000 \
+  --max_train_steps=30000 \
+  --resume_from_checkpoint="/root/autodl-tmp/lora_ckpt/2rf-sights-u_shaped_t/checkpoint-7000" \
+  --validation_prompt="Oriental Pearl Tower standing tall against a stormy Shanghai skyline. Dark clouds swirl above, illuminated by flashes of lightning cutting through the sky. The tower’s futuristic spheres glow faintly, reflecting off the rain-slicked streets below. Wind sweeps across the city, bending trees and causing ripples on the river. The lightning casts sharp shadows, adding depth and intensity to the scene. Use cinematic lighting and a high level of detail in the architecture and storm clouds. Dramatic and moody atmosphere." \
+  --validation_inference_steps=8 \
+  --lora_warmup_steps=0 \
   --validation_epochs=1 \
   --seed="0" \
-  --rank=64
-  --push_to_hub
+  --rank=128
