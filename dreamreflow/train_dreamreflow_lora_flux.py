@@ -277,6 +277,12 @@ def parse_args(input_args=None):
         help="The root directory of the instance dataset.",
     )
     parser.add_argument(
+        "--num_inversion_steps",
+        type=int,
+        default=100,
+        help="Number of inversion steps to perform.",
+    )
+    parser.add_argument(
         "--pretrained_lora_path",
         type=str,
         default=None,
@@ -341,8 +347,8 @@ def parse_args(input_args=None):
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
     parser.add_argument(
         "--resolution",
-        type=int,
-        default=1024,
+        type=str,
+        default="1024*1024",
         help=(
             "The resolution for input images, all the images in the train/validation dataset will be resized to this"
             " resolution"
@@ -589,9 +595,7 @@ class DreamBoosterDataset_v1(Dataset):
         self,
         prior_reflow_data_root,
         instance_data_root,
-        resolution=1024,
     ):
-        self.resolution = resolution
         self.prior_roots = {
             "img": Path(prior_reflow_data_root) / "img",
             "prompt": Path(prior_reflow_data_root) / "prompt",
@@ -718,7 +722,8 @@ class DreamBoosterDataset_v2(Dataset):
 
         self.prior_paths = self._get_data_paths(self.prior_roots)
         self.instance_paths = self._get_data_paths(self.instance_roots)
-        self.instance_z0_cache = [instance_data_item["id"]: None for instance_data_item in self.instance_paths] # initialize z_0 cache to None
+        self.instance_z0_cache = {instance_data_item["id"]: None for instance_data_item in self.instance_paths} # initialize z_0 cache to None
+        print(self.instance_z0_cache)
         self._length = max(len(self.prior_paths), len(self.instance_paths))
         
         self.img_transform = transforms.Compose([
@@ -732,11 +737,14 @@ class DreamBoosterDataset_v2(Dataset):
     def update_z0_cache(self, backward_reflow_func):
         for instance_path in self.instance_paths:
             instance_data = self._load_data(instance_path)
-            backward_reflow_func(  # backward reflow (add noise)
-                instance_data["prompt_embeds"],
-                instance_data["pooled_prompt_embeds"],
-                instance_data["latents"]
+            print(f"Updating z_0 cache for instance {instance_path['id']}")
+            z_0 = backward_reflow_func(  # backward reflow (add noise)
+                instance_data["prompt_embeds"].unsqueeze(0),
+                instance_data["pooled_prompt_embeds"].unsqueeze(0),
+                instance_data["latent"].unsqueeze(0),
             )
+            self.instance_z0_cache[instance_path["id"]] = z_0
+            torch.save(z_0.detach(), f"./{instance_path['id']}_z_0.pt")
 
     def _get_data_paths(self, roots):
         files_dict = {}
@@ -790,10 +798,10 @@ class DreamBoosterDataset_v2(Dataset):
         data["latent"] = torch.load(data_path["z_1"], map_location="cpu").squeeze(0)
 
         # Load gaussian
-        if "z_0" in data_path: # class prior data's z_0 is fixed
+        if "z_0" in data_path: # class prior data's z_0 is fixed 
             data["gaussian"] = torch.load(data_path["z_0"], map_location="cpu").squeeze(0)
         else: # instance data's z_0 is dynamic  (initialized to None)
-            data["guassian"] = self.instance_z0_cache[data_path["id"]]
+            data["gaussian"] = self.instance_z0_cache[data_path["id"]]
 
         return data
     
@@ -964,6 +972,68 @@ def encode_prompt(
     text_ids = text_ids.repeat(num_images_per_prompt, 1, 1)
 
     return prompt_embeds, pooled_prompt_embeds, text_ids
+
+@torch.inference_mode()
+def reverse_denoise(
+        prompt_embeds, 
+        pooled_prompt_embeds, 
+        latents, 
+        guidance_scale, 
+        transformer, 
+        weight_dtype,
+    ):
+    print(f"prompt_embeds.shape: {prompt_embeds.shape}")
+    print(f"pooled_prompt_embeds.shape: {pooled_prompt_embeds.shape}")
+    print(f"latents.shape: {latents.shape}")
+    prompt_embeds = prompt_embeds.to(weight_dtype).to(transformer.device)
+    pooled_prompt_embeds = pooled_prompt_embeds.to(weight_dtype).to(transformer.device)
+    latents = latents.to(weight_dtype).to(transformer.device)
+    text_ids = torch.zeros(prompt_embeds.shape[0], prompt_embeds.shape[1], 3,
+                device=prompt_embeds.device, dtype=weight_dtype)
+    latent_image_ids = FluxPipeline._prepare_latent_image_ids(
+        latents.shape[0],
+        latents.shape[2],
+        latents.shape[3],
+        latents.device,
+        weight_dtype,
+    )
+    packed_latents = FluxPipeline._pack_latents( # shape [num_samples, (resolution // 16 * resolution // 16), 16 * 2 * 2]
+        latents,
+        batch_size=latents.shape[0],
+        num_channels_latents=latents.shape[1],
+        height=latents.shape[2],
+        width=latents.shape[3],
+    )
+    timesteps = torch.linspace(1, 0, args.num_inversion_steps + 1)
+    timesteps = list(reversed(timesteps))
+    for t_curr, t_prev in zip(timesteps[:-1], timesteps[1:]):
+        t_vec = torch.full((packed_latents.shape[0],), t_curr, dtype=packed_latents.dtype, device=packed_latents.device)
+        guidance_vec = torch.full((packed_latents.shape[0],), guidance_scale, device=packed_latents.device, dtype=packed_latents.dtype)
+        print(f"X_{t_prev:.4f} = X_{t_curr:.4f} + h * F(X_{t_curr:.4f})")
+        pred = transformer(
+                hidden_states=packed_latents, # shape: [batch_size, seq_len, num_channels_latents], e.g. [1, 4096, 64] for 1024x1024
+                timestep=t_vec,               # range: [0, 1]
+                guidance=guidance_vec,        # scalar guidance values for each sample in the batch
+                pooled_projections=pooled_prompt_embeds, # CLIP text embedding
+                encoder_hidden_states=prompt_embeds,     # T5 text embedding
+                txt_ids=text_ids,
+                img_ids=latent_image_ids,
+                joint_attention_kwargs=None,
+                return_dict=False,
+            )[0]
+        packed_latents = packed_latents.to(torch.float32)
+        pred = pred.to(torch.float32)
+        packed_latents = packed_latents + (t_prev - t_curr) * pred
+        packed_latents = packed_latents.to(weight_dtype)
+
+    latents = FluxPipeline._unpack_latents(
+                    pred,
+                    height=int(latents.shape[2] * 16 / 2),
+                    width=int(latents.shape[3] * 16 / 2),
+                    vae_scale_factor=16,
+                )
+    latents = latents.squeeze(0).to("cpu")
+    return latents
 
 
 def main(args):
@@ -1307,10 +1377,9 @@ def main(args):
         return prompt_embeds, pooled_prompt_embeds, text_ids
     
     # Dataset and DataLoaders creation:
-    train_dataset = DreamBoosterDataset(
+    train_dataset = DreamBoosterDataset_v2(
         prior_reflow_data_root=args.prior_reflow_data_root,
         instance_data_root=args.instance_data_root,
-        resolution=args.resolution,
     )
 
     train_dataloader = torch.utils.data.DataLoader(
@@ -1456,13 +1525,13 @@ def main(args):
         t = t[:num_samples]
         return t
 
-    def sample_training_timesteps(t_dist, num_samples=1, image_seq_len):
+    def sample_training_timesteps(t_dist, num_samples, image_seq_len):
         if t_dist == "uniform":
             timesteps = torch.rand(num_samples, dtype=torch.float32)
         elif t_dist == "u_shape":
             timesteps = u_shaped_t(num_samples)
         elif t_dist == "logit_normal":
-            timesteps = torch.normal(mean=0., std=1., size=(batch_size,), dtype=torch.float32)
+            timesteps = torch.normal(mean=0., std=1., size=(num_samples,), dtype=torch.float32)
             timesteps = torch.nn.functional.sigmoid(timesteps)
         elif t_dist == "flux_shift":
             train_num_steps = torch.randint(1, 101, (1,)).item()
@@ -1471,7 +1540,7 @@ def main(args):
                             image_seq_len=image_seq_len,
                             shift=True, # Uniform is in the above
                         )[:-1]
-            timesteps = torch.tensor([timesteps[torch.randint(0, len(timesteps), (1,)).item()] for _ in range(latent.shape[0])])
+            timesteps = torch.tensor([t_list[torch.randint(0, len(t_list), (1,)).item()] for _ in range(latent.shape[0])])
         else:
             raise NotImplementedError(f"t_dist {t_dist} not implemented")
         return timesteps
@@ -1480,6 +1549,8 @@ def main(args):
         transformer.train()
 
         for step, batch in enumerate(train_dataloader):
+            # for key in batch:
+            #     print("batch has", key, " type", type(batch[key]))
             models_to_accumulate = [transformer]
             with accelerator.accumulate(models_to_accumulate):
                 if step % 2 == 0: # prior loss
@@ -1494,26 +1565,26 @@ def main(args):
                         t_dist = "logit_normal"
                     loss_scale = args.prior_loss_weight
                     print("prior reflow:", args.use_reflow_prior_loss)
-                    print("prior_latent", latent.shape, "prior_gaussian", gaussian.shape)
+                    # print("prior_latent", latent.shape, "prior_gaussian", gaussian.shape)
                 else: # instance loss
                     prompt_embeds = batch["instance_prompt_embeds"].to(dtype=weight_dtype)
                     pooled_prompt_embeds = batch["instance_pooled_prompt_embeds"].to(dtype=weight_dtype)
                     latent = batch["instance_latent"].to(dtype=weight_dtype)
-                    if batch["instance_gussian"] is None or not args.use_reflow_prior_loss: # use random z_0
+                    if any(item is None for item in batch["instance_gaussian"]) or not args.use_reflow_prior_loss: # use random z_0
                         gaussian = torch.randn_like(latent)
                         t_dist = "logit_normal"
                         loss_scale = 1.0
-                        print("Instance z_0: guassian ")
+                        print("Instance z_0: gaussian, not reversed")
                     else: # use reflow prior loss & z_0 is already computed
                         gaussian = batch["instance_gaussian"].to(dtype=weight_dtype)
                         t_dist = "flux_shift"
                         loss_scale = args.prior_loss_weight
                         print("Instance z_0: reversed")
-                    print("instance_latent", latent.shape, "instance_gaussian", gaussian.shape)
+                    # print("instance_latent", latent.shape, "instance_gaussian", gaussian.shape)
 
                 t = sample_training_timesteps(
-                    t_dist, latent.shape[0], (img_latents.shape[2]//2) * (img_latents.shape[3]//2)
-                    ).to(dtype=weight_dtype, device=img_latents.device)
+                    t_dist, latent.shape[0], (latent.shape[2]//2) * (latent.shape[3]//2)
+                    ).to(dtype=weight_dtype, device=latent.device)
                 print("train at t:", t, "t_dist:", t_dist)
 
                 latent_image_ids = FluxPipeline._prepare_latent_image_ids(
@@ -1543,11 +1614,11 @@ def main(args):
                 else:
                     guidance = None
 
-                print("packed_noisy_latents_input", packed_noisy_latent_input.shape)
-                print("t5 encoder_hidden_states", prompt_embeds.shape)
-                print("clip pooled_projections", pooled_prompt_embeds.shape)
-                print("text_ids", text_ids.shape)
-                print("latent_image_ids", latent_image_ids.shape)
+                # print("packed_noisy_latents_input", packed_noisy_latent_input.shape)
+                # print("t5 encoder_hidden_states", prompt_embeds.shape)
+                # print("clip pooled_projections", pooled_prompt_embeds.shape)
+                # print("text_ids", text_ids.shape)
+                # print("latent_image_ids", latent_image_ids.shape)
 
                 model_pred = transformer(
                     hidden_states=packed_noisy_latent_input,
@@ -1588,62 +1659,6 @@ def main(args):
                 progress_bar.update(1)
                 global_step += 1
 
-                if global_step % args.backward_update_steps == 0 and global_step > args.backward_reflow_threshold:
-
-                    def reverse_denoise(prompt_embeds, pooled_prompt_embeds, latents, guidance_scale=3.5):
-                        text_ids = torch.zeros(prompt_embeds.shape[0], prompt_embeds.shape[1], 3,
-                                    device=prompt_embeds.device, dtype=weight_dtype)
-                        latent_image_ids = FluxPipeline._prepare_latent_image_ids(
-                            latents.shape[0],
-                            latents.shape[2],
-                            latents.shape[3],
-                            latents.device,
-                            weight_dtype,
-                        )
-                        packed_latents = FluxPipeline._pack_latents( # shape [num_samples, (resolution // 16 * resolution // 16), 16 * 2 * 2]
-                            latents,
-                            batch_size=latents.shape[0],
-                            num_channels_latents=latents.shape[1],
-                            height=latents.shape[2],
-                            width=latents.shape[3],
-                        )
-                        timesteps = torch.linspace(1, 0, 100 + 1)
-                        timesteps = list(reversed(timesteps))
-                        for t_curr, t_prev in zip(timesteps[:-1], timesteps[1:]):
-                            t_vec = torch.full((packed_latents.shape[0],), t_curr, dtype=packed_latents.dtype, device=packed_latents.device)
-                            guidance_vec = torch.full((packed_latents.shape[0],), guidance_scale, device=packed_latents.device, dtype=packed_latents.dtype)
-                            print(f"Reversing instance z_0 at time: {t_vec[0]}")
-                            pred = pipeline.transformer(
-                                    hidden_states=packed_latents, # shape: [batch_size, seq_len, num_channels_latents], e.g. [1, 4096, 64] for 1024x1024
-                                    timestep=t_vec,        # range: [0, 1]
-                                    guidance=guidance_vec, # scalar guidance values for each sample in the batch
-                                    pooled_projections=pooled_prompt_embeds, # CLIP text embedding
-                                    encoder_hidden_states=prompt_embeds,     # T5 text embedding
-                                    txt_ids=text_ids,
-                                    img_ids=latent_image_ids,
-                                    joint_attention_kwargs=None,
-                                    return_dict=pipeline,
-                                )[0]
-                            packed_latents = packed_latents.to(torch.float32)
-                            pred = pred.to(torch.float32)
-                            packed_latents = packed_latents + (t_prev - t_curr) * pred
-                            packed_latents = packed_latents.to()
-                            progress_bar.update()
-                        latents = FluxPipeline._unpack_latents( # save, shape [num_samples, 16, resolution//8, resolution//8]
-                                packed_latents,
-                                height=1024,
-                                width=1024,
-                                vae_scale_factor=pipeline.vae_scale_factor,
-                        )
-                        return latents
-
-                    reverse_denoise_wrapper = lambda prompt_embeds, pooled_prompt_embeds, latents: reverse_denoise(
-                        prompt_embeds,
-                        pooled_prompt_embeds,
-                        latents,
-                        guidance_scale=3.5,
-                    )
-
                 if accelerator.is_main_process:
                     if global_step % args.checkpointing_steps == 0:
                         # _before_ saving state, check if this save would set us over the `checkpoints_total_limit`
@@ -1669,6 +1684,17 @@ def main(args):
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
+                
+                if global_step % args.backward_update_steps == 0 and global_step >= args.backward_reflow_threshold:
+                    reverse_denoise_wrapper = lambda prompt_embeds, pooled_prompt_embeds, latents: reverse_denoise(
+                        prompt_embeds,
+                        pooled_prompt_embeds,
+                        latents,
+                        guidance_scale=3.5,
+                        transformer=transformer,
+                        weight_dtype=weight_dtype,
+                    )
+                    train_dataset.update_z0_cache(reverse_denoise_wrapper)
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
