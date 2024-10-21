@@ -1,5 +1,5 @@
 export MODEL_NAME="/root/autodl-tmp/FLUX-dev"
-export OUTPUT_DIR="/root/autodl-tmp/lora_ckpt/dreambooth-dog-dynamic-backward"
+export OUTPUT_DIR="/root/autodl-tmp/lora_ckpt/dreambooth-dog-prior_reflow-no_backward"
 
 accelerate launch train_dreamreflow_lora_flux.py \
   --pretrained_model_name_or_path=$MODEL_NAME \
@@ -7,8 +7,9 @@ accelerate launch train_dreamreflow_lora_flux.py \
   --prior_reflow_data_root="/root/autodl-tmp/data/1rf_dog" \
   --instance_data_root="/root/autodl-tmp/data/dog-instance" \
   --use_reflow_prior_loss \
+  --resume_from_checkpoint="/root/autodl-tmp/lora_ckpt/dreambooth-dog-prior_reflow-no_backward/checkpoint-1000" \
   --backward_reflow_threshold=1000 \
-  --backward_update_steps=400 \
+  --backward_update_steps=5000 \
   --num_inversion_steps=100 \
   --mixed_precision="bf16" \
   --resolution="1024*1024" \
