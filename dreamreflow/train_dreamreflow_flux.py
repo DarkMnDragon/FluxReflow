@@ -37,30 +37,21 @@ from accelerate.logging import get_logger
 from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, set_seed
 from huggingface_hub import create_repo, upload_folder
 from huggingface_hub.utils import insecure_hashlib
-from peft import LoraConfig, set_peft_model_state_dict
-from peft.utils import get_peft_model_state_dict
 from PIL import Image
 from PIL.ImageOps import exif_transpose
 from torch.utils.data import Dataset
 from torchvision import transforms
 from torchvision.transforms.functional import crop
 from tqdm.auto import tqdm
-from transformers import CLIPTokenizer, PretrainedConfig, T5TokenizerFast
+from transformers import CLIPTextModelWithProjection, CLIPTokenizer, PretrainedConfig, T5EncoderModel, T5TokenizerFast
 
 import diffusers
 from diffusers import (
     AutoencoderKL,
-    FlowMatchEulerDiscreteScheduler,
     FluxPipeline,
     FluxTransformer2DModel,
 )
 from diffusers.optimization import get_scheduler
-from diffusers.training_utils import (
-    _set_state_dict_into_text_encoder,
-    cast_training_params,
-    compute_density_for_timestep_sampling,
-    compute_loss_weighting_for_sd3,
-)
 from diffusers.utils import (
     check_min_version,
     convert_unet_state_dict_to_peft,
@@ -265,13 +256,11 @@ def parse_args(input_args=None):
     parser.add_argument(
         "--backward_reflow_threshold",
         type=int,
-        default=1000,
         help="After how many steps to start backward reflow.",
     )
     parser.add_argument(
         "--backward_update_steps",
         type=int,
-        default=100,
         help="How many steps to update the backward z_0.",
     )
     parser.add_argument(
@@ -286,12 +275,6 @@ def parse_args(input_args=None):
         type=int,
         default=100,
         help="Number of inversion steps to perform.",
-    )
-    parser.add_argument(
-        "--pretrained_lora_path",
-        type=str,
-        default=None,
-        help="Path to pretrained LoRA model.",
     )
     parser.add_argument(
         "--cache_dir",
@@ -333,20 +316,26 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument(
-        "--rank",
-        type=int,
-        default=128,
-        help=("The dimension of the LoRA update matrices."),
-    )
-    parser.add_argument(
         "--prior_loss_weight", 
         type=float, default=1.0, 
         help="The weight of prior preservation loss.",
     )
     parser.add_argument(
+        "--gaussian_pair_t_dist",
+        type=str,
+        default="logit_normal",
+        help="t distribution for training, choose be ['uniform', 'u_shape', 'logit_normal', 'flux_shift']",
+    )
+    parser.add_argument(
+        "--reflow_pair_t_dist",
+        type=str,
+        default="u_shape",
+        help="t distribution for training, choose be ['uniform', 'u_shape', 'logit_normal', 'flux_shift']",
+    )
+    parser.add_argument(
         "--output_dir",
         type=str,
-        default="flux-dreambooth-lora",
+        default="flux-dreambooth",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
@@ -484,7 +473,7 @@ def parse_args(input_args=None):
         "--optimizer",
         type=str,
         default="AdamW",
-        help=('The optimizer type to use. Choose between ["AdamW", "prodigy"]'),
+        help=('The optimizer type to use. Choose between ["AdamW", "prodigy", "Adafactor"]'),
     )
 
     parser.add_argument(
@@ -584,6 +573,9 @@ def parse_args(input_args=None):
         args = parser.parse_args(input_args)
     else:
         args = parser.parse_args()
+
+    if not args.use_dynamic_instance_reflow and (args.backward_reflow_threshold is not None or args.backward_update_steps is not None):
+        raise ValueError("You must set --use_dynamic_instance_reflow if you want to use backward reflow.")
 
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
@@ -951,7 +943,6 @@ def encode_prompt(
     text_input_ids_list=None,
 ):
     prompt = [prompt] if isinstance(prompt, str) else prompt
-    batch_size = len(prompt)
     dtype = text_encoders[0].dtype
 
     pooled_prompt_embeds = _encode_prompt_with_clip(
@@ -973,10 +964,10 @@ def encode_prompt(
         text_input_ids=text_input_ids_list[1] if text_input_ids_list else None,
     )
 
-    text_ids = torch.zeros(batch_size, prompt_embeds.shape[1], 3).to(device=device, dtype=dtype)
-    text_ids = text_ids.repeat(num_images_per_prompt, 1, 1)
+    text_ids = torch.zeros(prompt_embeds.shape[1], 3).to(device=device, dtype=dtype)
 
     return prompt_embeds, pooled_prompt_embeds, text_ids
+
 
 @torch.inference_mode()
 def reverse_denoise(
@@ -1121,11 +1112,6 @@ def main(args):
         args.pretrained_model_name_or_path, subfolder="text_encoder_2"
     )
 
-    # Load scheduler and models
-    noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="scheduler"
-    )
-    noise_scheduler_copy = copy.deepcopy(noise_scheduler)
     text_encoder_one, text_encoder_two = load_text_encoders(text_encoder_cls_one, text_encoder_cls_two)
     vae = AutoencoderKL.from_pretrained(
         args.pretrained_model_name_or_path,
@@ -1136,8 +1122,8 @@ def main(args):
         args.pretrained_model_name_or_path, subfolder="transformer", variant=args.variant
     )
 
-    # We only train the additional adapter LoRA layers
-    transformer.requires_grad_(False)
+    # We only train the FluxTransformer2DModel
+    transformer.requires_grad_(True)
     vae.requires_grad_(False)
     text_encoder_one.requires_grad_(False)
     text_encoder_two.requires_grad_(False)
@@ -1156,65 +1142,13 @@ def main(args):
             "Mixed precision training with bfloat16 is not supported on MPS. Please use fp16 (recommended) or fp32 instead."
         )
 
-    vae.to(accelerator.device, dtype=weight_dtype)
     transformer.to(accelerator.device, dtype=weight_dtype)
+    vae.to(accelerator.device, dtype=weight_dtype)
     text_encoder_one.to(accelerator.device, dtype=weight_dtype)
     text_encoder_two.to(accelerator.device, dtype=weight_dtype)
 
     if args.gradient_checkpointing:
         transformer.enable_gradient_checkpointing()
-
-    # now we will add new LoRA weights to the attention layers
-    transformer_lora_config = LoraConfig(
-        r=args.rank,
-        lora_alpha=args.rank,
-        init_lora_weights="gaussian",
-        target_modules=["to_k", 
-                        "to_q", 
-                        "to_v", 
-                        "to_out.0",
-                        "add_k_proj",
-                        "add_q_proj",
-                        "add_v_proj",
-                        "to_add_out",
-                        "norm.linear",
-                        "proj_mlp",
-                        "proj_out",
-                        "ff.net.0.proj",
-                        "ff.net.2",
-                        "ff_context.net.0.proj",
-                        "ff_context.net.2",
-                        "norm1.linear",
-                        "norm1_context.linear",
-                        "norm.linear",
-                        "timestep_embedder.linear_1",
-                        "timestep_embedder.linear_2",
-                        "guidance_embedder.linear_1",
-                        "guidance_embedder.linear_2",
-                        ],
-    )
-    transformer.add_adapter(transformer_lora_config)
-
-    # Load pretrained LoRA weights
-    def load_pretrained_rf(transformer, ckpt_path):
-        lora_state_dict = FluxPipeline.lora_state_dict(ckpt_path)
-        transformer_state_dict = {
-            f'{k.replace("transformer.", "")}': v for k, v in lora_state_dict.items() if k.startswith("transformer.")
-        }
-        transformer_state_dict = convert_unet_state_dict_to_peft(transformer_state_dict)
-        incompatible_keys = set_peft_model_state_dict(transformer, transformer_state_dict, adapter_name="default")
-        if incompatible_keys is not None:
-            # check only for unexpected keys
-            unexpected_keys = getattr(incompatible_keys, "unexpected_keys", None)
-            if unexpected_keys:
-                print(
-                    f"Loading loaded pretrained (k-1) rf from {ckpt_path} led to unexpected keys not found in the model: "
-                    f" {unexpected_keys}. "
-                )
-            else: 
-                print("Successfully loaded pretrained (k-1) rf")
-    if args.pretrained_lora_path is not None:
-        load_pretrained_rf(transformer, args.rf_lora_ckpt_path)
 
     def unwrap_model(model):
         model = accelerator.unwrap_model(model)
@@ -1224,63 +1158,49 @@ def main(args):
     # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
     def save_model_hook(models, weights, output_dir):
         if accelerator.is_main_process:
-            transformer_lora_layers_to_save = None
-            text_encoder_one_lora_layers_to_save = None
-
-            for model in models:
-                if isinstance(model, type(unwrap_model(transformer))):
-                    transformer_lora_layers_to_save = get_peft_model_state_dict(model)
-                elif isinstance(model, type(unwrap_model(text_encoder_one))):
-                    text_encoder_one_lora_layers_to_save = get_peft_model_state_dict(model)
+            for i, model in enumerate(models):
+                if isinstance(unwrap_model(model), FluxTransformer2DModel):
+                    unwrap_model(model).save_pretrained(os.path.join(output_dir, "transformer"))
+                elif isinstance(unwrap_model(model), (CLIPTextModelWithProjection, T5EncoderModel)): # Maybe not to save T5EncoderModel
+                    if isinstance(unwrap_model(model), CLIPTextModelWithProjection):
+                        # unwrap_model(model).save_pretrained(os.path.join(output_dir, "text_encoder"))
+                        print("Skipping saving text_encoder_1, CLIPTextModelWithProjection")
+                    else:
+                        # unwrap_model(model).save_pretrained(os.path.join(output_dir, "text_encoder_2"))
+                        print("Skipping saving text_encoder_2, T5EncoderModel")
                 else:
-                    raise ValueError(f"unexpected save model: {model.__class__}")
+                    raise ValueError(f"Wrong model supplied: {type(model)=}.")
 
                 # make sure to pop weight so that corresponding model is not saved again
                 weights.pop()
 
-            FluxPipeline.save_lora_weights(
-                output_dir,
-                transformer_lora_layers=transformer_lora_layers_to_save,
-                text_encoder_lora_layers=text_encoder_one_lora_layers_to_save,
-            )
-
     def load_model_hook(models, input_dir):
-        transformer_ = None
-        text_encoder_one_ = None
-
-        while len(models) > 0:
+        for _ in range(len(models)):
+            # pop models so that they are not loaded again
             model = models.pop()
 
-            if isinstance(model, type(unwrap_model(transformer))):
-                transformer_ = model
-            elif isinstance(model, type(unwrap_model(text_encoder_one))):
-                text_encoder_one_ = model
+            # load diffusers style into model
+            if isinstance(unwrap_model(model), FluxTransformer2DModel):
+                load_model = FluxTransformer2DModel.from_pretrained(input_dir, subfolder="transformer")
+                model.register_to_config(**load_model.config)
+
+                model.load_state_dict(load_model.state_dict())
+            elif isinstance(unwrap_model(model), (CLIPTextModelWithProjection, T5EncoderModel)):
+                try:
+                    load_model = CLIPTextModelWithProjection.from_pretrained(input_dir, subfolder="text_encoder")
+                    model(**load_model.config)
+                    model.load_state_dict(load_model.state_dict())
+                except Exception:
+                    try:
+                        load_model = T5EncoderModel.from_pretrained(input_dir, subfolder="text_encoder_2")
+                        model(**load_model.config)
+                        model.load_state_dict(load_model.state_dict())
+                    except Exception:
+                        raise ValueError(f"Couldn't load the model of type: ({type(model)}).")
             else:
-                raise ValueError(f"unexpected save model: {model.__class__}")
+                raise ValueError(f"Unsupported model found: {type(model)=}")
 
-        lora_state_dict = FluxPipeline.lora_state_dict(input_dir)
-
-        transformer_state_dict = {
-            f'{k.replace("transformer.", "")}': v for k, v in lora_state_dict.items() if k.startswith("transformer.")
-        }
-        transformer_state_dict = convert_unet_state_dict_to_peft(transformer_state_dict)
-        incompatible_keys = set_peft_model_state_dict(transformer_, transformer_state_dict, adapter_name="default")
-        if incompatible_keys is not None:
-            # check only for unexpected keys
-            unexpected_keys = getattr(incompatible_keys, "unexpected_keys", None)
-            if unexpected_keys:
-                logger.warning(
-                    f"Loading adapter weights from state_dict led to unexpected keys not found in the model: "
-                    f" {unexpected_keys}. "
-                )
-
-        # Make sure the trainable params are in float32. This is again needed since the base models
-        # are in `weight_dtype`. More details:
-        # https://github.com/huggingface/diffusers/pull/6514#discussion_r1449796804
-        if args.mixed_precision == "fp16":
-            models = [transformer_]
-            # only upcast trainable parameters (LoRA) into fp32
-            cast_training_params(models)
+            del load_model
 
     accelerator.register_save_state_pre_hook(save_model_hook)
     accelerator.register_load_state_pre_hook(load_model_hook)
@@ -1295,24 +1215,14 @@ def main(args):
             args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
         )
 
-    # Make sure the trainable params are in float32.
-    if args.mixed_precision == "fp16":
-        models = [transformer]
-        # only upcast trainable parameters (LoRA) into fp32
-        cast_training_params(models, dtype=torch.float32)
-
-    transformer_lora_parameters = list(filter(lambda p: p.requires_grad, transformer.parameters()))
-    num_trainable_params = sum(p.numel() for p in transformer_lora_parameters)
-    print(f"Number of trainable parameters in transformer LoRA: {num_trainable_params}")
-
     # Optimization parameters
-    transformer_parameters_with_lr = {"params": transformer_lora_parameters, "lr": args.learning_rate}
+    transformer_parameters_with_lr = {"params": transformer.parameters(), "lr": args.learning_rate}
     params_to_optimize = [transformer_parameters_with_lr]
 
     # Optimizer creation
-    if not (args.optimizer.lower() == "prodigy" or args.optimizer.lower() == "adamw"):
+    if not (args.optimizer.lower() == "prodigy" or args.optimizer.lower() == "adamw" or args.optimizer.lower() == "adafactor"):
         logger.warning(
-            f"Unsupported choice of optimizer: {args.optimizer}.Supported optimizers include [adamW, prodigy]."
+            f"Unsupported choice of optimizer: {args.optimizer}.Supported optimizers include [adamW, prodigy, adafactor]."
             "Defaulting to adamW"
         )
         args.optimizer = "adamw"
@@ -1366,6 +1276,23 @@ def main(args):
             decouple=args.prodigy_decouple,
             use_bias_correction=args.prodigy_use_bias_correction,
             safeguard_warmup=args.prodigy_safeguard_warmup,
+        )
+
+    if args.optimizer.lower() == "adafactor":
+        try:
+            from transformers.optimization import Adafactor
+        except ImportError:
+            raise ImportError("To use Adafactor, please install the transformers library: `pip install transformers`")
+        
+        optimizer_class = Adafactor
+
+        optimizer = optimizer_class(
+            params_to_optimize,
+            lr=args.learning_rate,
+            scale_parameter=False,
+            relative_step=False,
+            warmup_init=False,
+            weight_decay=0.01,
         )
 
     tokenizers = [tokenizer_one, tokenizer_two]
@@ -1441,7 +1368,7 @@ def main(args):
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
-        tracker_name = "flux-dreamreflow-lora"
+        tracker_name = "flux-dreamreflow-finetune"
         accelerator.init_trackers(tracker_name, config=vars(args))
 
     # Train!
@@ -1564,10 +1491,10 @@ def main(args):
                     latent = batch["prior_latent"].to(dtype=weight_dtype)
                     if args.use_reflow_prior_loss: # reflow z_0
                         gaussian = batch["prior_gaussian"].to(dtype=weight_dtype) 
-                        t_dist = "u_shape"
-                    else: # dreambooth baseline
+                        t_dist = args.reflow_pair_t_dist
+                    else: # dreambooth base prior loss
                         gaussian = torch.randn_like(latent) 
-                        t_dist = "uniform"
+                        t_dist = args.gaussian_pair_t_dist
                     loss_scale = args.prior_loss_weight
                     print("prior reflow:", args.use_reflow_prior_loss, "prior data id", batch["prior_id"])
                     # print("prior_latent", latent.shape, "prior_gaussian", gaussian.shape)
@@ -1577,12 +1504,12 @@ def main(args):
                     latent = batch["instance_latent"].to(dtype=weight_dtype)
                     if any(item is None for item in batch["instance_gaussian"]) or not args.use_dynamic_instance_reflow: # use random z_0
                         gaussian = torch.randn_like(latent)
-                        t_dist = "uniform"
+                        t_dist = args.gaussian_pair_t_dist
                         loss_scale = 1.0
                         print("Instance z_0: gaussian, not reversed")
                     else: # use reflow prior loss & z_0 is already computed
                         gaussian = batch["instance_gaussian"].to(dtype=weight_dtype)
-                        t_dist = "u_shape"
+                        t_dist = args.reflow_pair_t_dist
                         loss_scale = args.prior_loss_weight
                         print("Instance z_0: reversed")
                     print("instance data id", batch["instance_id"])
@@ -1735,31 +1662,22 @@ def main(args):
                 torch.cuda.empty_cache()
                 gc.collect()
 
-    # Save the lora layers
+    # Save the final model
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         transformer = unwrap_model(transformer)
         transformer = transformer.to(torch.float32)
-        transformer_lora_layers = get_peft_model_state_dict(transformer)
-
-        text_encoder_lora_layers = None
-
-        FluxPipeline.save_lora_weights(
-            save_directory=args.output_dir,
-            transformer_lora_layers=transformer_lora_layers,
-            text_encoder_lora_layers=text_encoder_lora_layers,
-        )
+        
+        pipeline = FluxPipeline.from_pretrained(args.pretrained_model_name_or_path, transformer=transformer)
+        pipeline.save_pretrained(args.output_dir)
 
         # Final inference
         # Load previous pipeline
         pipeline = FluxPipeline.from_pretrained(
-            args.pretrained_model_name_or_path,
+            args.output_dir,
             variant=args.variant,
             torch_dtype=weight_dtype,
         )
-        # load attention processors
-        pipeline.load_lora_weights(args.output_dir)
-
         # run inference
         images = []
         if args.validation_prompt and args.num_validation_images > 0:
