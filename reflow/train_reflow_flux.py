@@ -530,9 +530,6 @@ def parse_args(input_args=None):
     else:
         args = parser.parse_args()
 
-    if not args.use_dynamic_instance_reflow and (args.backward_reflow_threshold is not None or args.backward_update_steps is not None):
-        raise ValueError("You must set --use_dynamic_instance_reflow if you want to use backward reflow.")
-
     env_local_rank = int(os.environ.get("LOCAL_RANK", -1))
     if env_local_rank != -1 and env_local_rank != args.local_rank:
         args.local_rank = env_local_rank
@@ -1215,11 +1212,12 @@ def main(args):
                 latent = batch["latent"].to(dtype=weight_dtype)
                 gaussian = batch["gaussian"].to(dtype=weight_dtype) 
                 t_dist = args.training_t_dist
-                print("train at t:", t, "t_dist:", t_dist, "prompt:", prompt)
 
                 t = sample_training_timesteps(
                     t_dist, latent.shape[0], (latent.shape[2]//2) * (latent.shape[3]//2)
                     ).to(dtype=weight_dtype, device=latent.device)
+                
+                print("train at t:", t, "t_dist:", t_dist, "prompt:", prompt)
 
                 latent_image_ids = FluxPipeline._prepare_latent_image_ids(
                         latent.shape[0],
