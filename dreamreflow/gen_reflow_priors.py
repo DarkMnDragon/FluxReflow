@@ -3,7 +3,7 @@ import argparse
 
 from PIL import Image
 from flux_utils import get_models, get_noise, get_schedule, decode_imgs
-from prompt_dataset import PromptDataset
+from prompts_data.prompt_dataset import PromptDataset
 from diffusers import FluxPipeline
 from torch.utils.data import DataLoader
 from pathlib import Path
