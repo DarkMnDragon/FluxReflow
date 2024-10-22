@@ -244,35 +244,13 @@ def parse_args(input_args=None):
         default=None,
         help="Variant of the model files of the pretrained model identifier from huggingface.co/models, 'e.g.' fp16",
     )
-    # reflow & instance dataset
+    # instance dataset
     parser.add_argument(
         "--prior_reflow_data_root",
         type=str,
         default=None,
         required=True,
-        help="The root directory of the prior reflow dataset.",
-    )
-    parser.add_argument(
-        "--use_reflow_prior_loss",
-        action="store_true",
-        help="Whether to use the reflow prior loss.",
-    )
-    parser.add_argument(
-        "--use_dynamic_instance_reflow",
-        action="store_true",
-        help="Whether to use dynamic instance reflow.",
-    )
-    parser.add_argument(
-        "--backward_reflow_threshold",
-        type=int,
-        default=1000,
-        help="After how many steps to start backward reflow.",
-    )
-    parser.add_argument(
-        "--backward_update_steps",
-        type=int,
-        default=100,
-        help="How many steps to update the backward z_0.",
+        help="The root directory of the class prior dataset.",
     )
     parser.add_argument(
         "--instance_data_root",
@@ -282,10 +260,10 @@ def parse_args(input_args=None):
         help="The root directory of the instance dataset.",
     )
     parser.add_argument(
-        "--num_inversion_steps",
-        type=int,
-        default=100,
-        help="Number of inversion steps to perform.",
+        "--training_t_dist",
+        type=str,
+        default="uniform",
+        help="t distribution for training, choose be ['uniform', 'u_shape', 'logit_normal', 'flux_shift']",
     )
     parser.add_argument(
         "--pretrained_lora_path",
@@ -978,68 +956,6 @@ def encode_prompt(
 
     return prompt_embeds, pooled_prompt_embeds, text_ids
 
-@torch.inference_mode()
-def reverse_denoise(
-        prompt_embeds, 
-        pooled_prompt_embeds, 
-        latents, 
-        guidance_scale, 
-        transformer, 
-        weight_dtype,
-    ):
-    print(f"prompt_embeds.shape: {prompt_embeds.shape}")
-    print(f"pooled_prompt_embeds.shape: {pooled_prompt_embeds.shape}")
-    print(f"latents.shape: {latents.shape}")
-    prompt_embeds = prompt_embeds.to(weight_dtype).to(transformer.device)
-    pooled_prompt_embeds = pooled_prompt_embeds.to(weight_dtype).to(transformer.device)
-    latents = latents.to(weight_dtype).to(transformer.device)
-    text_ids = torch.zeros(prompt_embeds.shape[0], prompt_embeds.shape[1], 3,
-                device=prompt_embeds.device, dtype=weight_dtype)
-    latent_image_ids = FluxPipeline._prepare_latent_image_ids(
-        latents.shape[0],
-        latents.shape[2],
-        latents.shape[3],
-        latents.device,
-        weight_dtype,
-    )
-    packed_latents = FluxPipeline._pack_latents( # shape [num_samples, (resolution // 16 * resolution // 16), 16 * 2 * 2]
-        latents,
-        batch_size=latents.shape[0],
-        num_channels_latents=latents.shape[1],
-        height=latents.shape[2],
-        width=latents.shape[3],
-    )
-    timesteps = torch.linspace(1, 0, args.num_inversion_steps + 1)
-    timesteps = list(reversed(timesteps))
-    for t_curr, t_prev in zip(timesteps[:-1], timesteps[1:]):
-        t_vec = torch.full((packed_latents.shape[0],), t_curr, dtype=packed_latents.dtype, device=packed_latents.device)
-        guidance_vec = torch.full((packed_latents.shape[0],), guidance_scale, device=packed_latents.device, dtype=packed_latents.dtype)
-        print(f"X_{t_prev:.4f} = X_{t_curr:.4f} + h * F(X_{t_curr:.4f})")
-        pred = transformer(
-                hidden_states=packed_latents, # shape: [batch_size, seq_len, num_channels_latents], e.g. [1, 4096, 64] for 1024x1024
-                timestep=t_vec,               # range: [0, 1]
-                guidance=guidance_vec,        # scalar guidance values for each sample in the batch
-                pooled_projections=pooled_prompt_embeds, # CLIP text embedding
-                encoder_hidden_states=prompt_embeds,     # T5 text embedding
-                txt_ids=text_ids,
-                img_ids=latent_image_ids,
-                joint_attention_kwargs=None,
-                return_dict=False,
-            )[0]
-        packed_latents = packed_latents.to(torch.float32)
-        pred = pred.to(torch.float32)
-        packed_latents = packed_latents + (t_prev - t_curr) * pred
-        packed_latents = packed_latents.to(weight_dtype)
-
-    latents = FluxPipeline._unpack_latents(
-                    packed_latents, # BUG!!!!!!!
-                    height=int(latents.shape[2] * 16 / 2),
-                    width=int(latents.shape[3] * 16 / 2),
-                    vae_scale_factor=16,
-                )
-    latents = latents.squeeze(0).to("cpu")
-    return latents
-
 
 def main(args):
     if args.report_to == "wandb" and args.hub_token is not None:
@@ -1558,35 +1474,32 @@ def main(args):
             #     print("batch has", key, " type", type(batch[key]))
             models_to_accumulate = [transformer]
             with accelerator.accumulate(models_to_accumulate):
-                if step % 2 == 0: # prior loss
-                    prompt_embeds = batch["prior_prompt_embeds"].to(dtype=weight_dtype)
-                    pooled_prompt_embeds = batch["prior_pooled_prompt_embeds"].to(dtype=weight_dtype)
-                    latent = batch["prior_latent"].to(dtype=weight_dtype)
-                    if args.use_reflow_prior_loss: # reflow z_0
-                        gaussian = batch["prior_gaussian"].to(dtype=weight_dtype) 
-                        t_dist = "u_shape"
-                    else: # dreambooth baseline
-                        gaussian = torch.randn_like(latent) 
-                        t_dist = "uniform"
-                    loss_scale = args.prior_loss_weight
-                    print("prior reflow:", args.use_reflow_prior_loss, "prior data id", batch["prior_id"])
-                    # print("prior_latent", latent.shape, "prior_gaussian", gaussian.shape)
-                else: # instance loss
-                    prompt_embeds = batch["instance_prompt_embeds"].to(dtype=weight_dtype)
-                    pooled_prompt_embeds = batch["instance_pooled_prompt_embeds"].to(dtype=weight_dtype)
-                    latent = batch["instance_latent"].to(dtype=weight_dtype)
-                    if any(item is None for item in batch["instance_gaussian"]) or not args.use_dynamic_instance_reflow: # use random z_0
-                        gaussian = torch.randn_like(latent)
-                        t_dist = "uniform"
-                        loss_scale = 1.0
-                        print("Instance z_0: gaussian, not reversed")
-                    else: # use reflow prior loss & z_0 is already computed
-                        gaussian = batch["instance_gaussian"].to(dtype=weight_dtype)
-                        t_dist = "u_shape"
-                        loss_scale = args.prior_loss_weight
-                        print("Instance z_0: reversed")
-                    print("instance data id", batch["instance_id"])
-                    # print("instance_latent", latent.shape, "instance_gaussian", gaussian.shape)
+                # if step % 2 == 0: # prior loss
+                #     prompt_embeds = batch["prior_prompt_embeds"].to(dtype=weight_dtype)
+                #     pooled_prompt_embeds = batch["prior_pooled_prompt_embeds"].to(dtype=weight_dtype)
+                #     latent = batch["prior_latent"].to(dtype=weight_dtype)
+                #     if args.use_reflow_prior_loss: # reflow z_0
+                #         gaussian = batch["prior_gaussian"].to(dtype=weight_dtype) 
+                #         t_dist = "u_shape"
+                #     else: # dreambooth baseline
+                #         gaussian = torch.randn_like(latent) 
+                #         t_dist = "uniform"
+                #     loss_scale = args.prior_loss_weight
+                #     print("prior reflow:", args.use_reflow_prior_loss, "prior data id", batch["prior_id"])
+                #     # print("prior_latent", latent.shape, "prior_gaussian", gaussian.shape)
+                # else: # instance loss
+
+                # NOTE: not to use prior loss 
+                prompt_embeds = batch["instance_prompt_embeds"].to(dtype=weight_dtype)
+                pooled_prompt_embeds = batch["instance_pooled_prompt_embeds"].to(dtype=weight_dtype)
+                latent = batch["instance_latent"].to(dtype=weight_dtype)
+                gaussian = torch.randn_like(latent)
+                # t_dist = 
+                t_dist = args.training_t_dist
+                loss_scale = 1.0
+                print("Instance z_0: gaussian, not reversed")
+                print("instance data id", batch["instance_id"])
+                # print("instance_latent", latent.shape, "instance_gaussian", gaussian.shape)
 
                 t = sample_training_timesteps(
                     t_dist, latent.shape[0], (latent.shape[2]//2) * (latent.shape[3]//2)
@@ -1690,17 +1603,7 @@ def main(args):
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
-                
-                if args.use_dynamic_instance_reflow and args.global_step % args.backward_update_steps == 0 and global_step >= args.backward_reflow_threshold:
-                    reverse_denoise_wrapper = lambda prompt_embeds, pooled_prompt_embeds, latents: reverse_denoise(
-                        prompt_embeds,
-                        pooled_prompt_embeds,
-                        latents,
-                        guidance_scale=3.5,
-                        transformer=transformer,
-                        weight_dtype=weight_dtype,
-                    )
-                    train_dataset.update_z0_cache(reverse_denoise_wrapper)
+
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)

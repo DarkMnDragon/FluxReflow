@@ -37,30 +37,21 @@ from accelerate.logging import get_logger
 from accelerate.utils import DistributedDataParallelKwargs, ProjectConfiguration, set_seed
 from huggingface_hub import create_repo, upload_folder
 from huggingface_hub.utils import insecure_hashlib
-from peft import LoraConfig, set_peft_model_state_dict
-from peft.utils import get_peft_model_state_dict
 from PIL import Image
 from PIL.ImageOps import exif_transpose
 from torch.utils.data import Dataset
 from torchvision import transforms
 from torchvision.transforms.functional import crop
 from tqdm.auto import tqdm
-from transformers import CLIPTokenizer, PretrainedConfig, T5TokenizerFast
+from transformers import CLIPTextModelWithProjection, CLIPTokenizer, PretrainedConfig, T5EncoderModel, T5TokenizerFast
 
 import diffusers
 from diffusers import (
     AutoencoderKL,
-    FlowMatchEulerDiscreteScheduler,
     FluxPipeline,
     FluxTransformer2DModel,
 )
 from diffusers.optimization import get_scheduler
-from diffusers.training_utils import (
-    _set_state_dict_into_text_encoder,
-    cast_training_params,
-    compute_density_for_timestep_sampling,
-    compute_loss_weighting_for_sd3,
-)
 from diffusers.utils import (
     check_min_version,
     convert_unet_state_dict_to_peft,
@@ -244,54 +235,13 @@ def parse_args(input_args=None):
         default=None,
         help="Variant of the model files of the pretrained model identifier from huggingface.co/models, 'e.g.' fp16",
     )
-    # reflow & instance dataset
+    # ReflowDataset
     parser.add_argument(
-        "--prior_reflow_data_root",
+        "--reflow_data_root",
         type=str,
         default=None,
         required=True,
-        help="The root directory of the prior reflow dataset.",
-    )
-    parser.add_argument(
-        "--use_reflow_prior_loss",
-        action="store_true",
-        help="Whether to use the reflow prior loss.",
-    )
-    parser.add_argument(
-        "--use_dynamic_instance_reflow",
-        action="store_true",
-        help="Whether to use dynamic instance reflow.",
-    )
-    parser.add_argument(
-        "--backward_reflow_threshold",
-        type=int,
-        default=1000,
-        help="After how many steps to start backward reflow.",
-    )
-    parser.add_argument(
-        "--backward_update_steps",
-        type=int,
-        default=100,
-        help="How many steps to update the backward z_0.",
-    )
-    parser.add_argument(
-        "--instance_data_root",
-        type=str,
-        default=None,
-        required=True,
-        help="The root directory of the instance dataset.",
-    )
-    parser.add_argument(
-        "--num_inversion_steps",
-        type=int,
-        default=100,
-        help="Number of inversion steps to perform.",
-    )
-    parser.add_argument(
-        "--pretrained_lora_path",
-        type=str,
-        default=None,
-        help="Path to pretrained LoRA model.",
+        help="The root directory of the reflow dataset.",
     )
     parser.add_argument(
         "--cache_dir",
@@ -333,20 +283,15 @@ def parse_args(input_args=None):
         ),
     )
     parser.add_argument(
-        "--rank",
-        type=int,
-        default=128,
-        help=("The dimension of the LoRA update matrices."),
-    )
-    parser.add_argument(
-        "--prior_loss_weight", 
-        type=float, default=1.0, 
-        help="The weight of prior preservation loss.",
+        "--training_t_dist",
+        type=str,
+        default="u_shape",
+        help="t distribution for training, choose be ['uniform', 'u_shape', 'logit_normal', 'flux_shift']",
     )
     parser.add_argument(
         "--output_dir",
         type=str,
-        default="flux-dreambooth-lora",
+        default="flux-reflow-full-finetuing",
         help="The output directory where the model predictions and checkpoints will be written.",
     )
     parser.add_argument("--seed", type=int, default=None, help="A seed for reproducible training.")
@@ -484,7 +429,7 @@ def parse_args(input_args=None):
         "--optimizer",
         type=str,
         default="AdamW",
-        help=('The optimizer type to use. Choose between ["AdamW", "prodigy"]'),
+        help=('The optimizer type to use. Choose between ["AdamW", "prodigy", "Adafactor"]'),
     )
 
     parser.add_argument(
@@ -591,245 +536,69 @@ def parse_args(input_args=None):
 
     return args
 
-    
-class DreamBoosterDataset_v1(Dataset):
+
+class ReflowDataset(Dataset):
     """
-    Customized data & class prior data
+    A dataset containing the reflow pairs and precomputed prompts.
     """
+
     def __init__(
         self,
-        prior_reflow_data_root,
-        instance_data_root,
+        reflow_data_dir,
     ):
-        self.prior_roots = {
-            "img": Path(prior_reflow_data_root) / "img",
-            "prompt": Path(prior_reflow_data_root) / "prompt",
-            "z_0": Path(prior_reflow_data_root) / "z_0",
-            "z_1": Path(prior_reflow_data_root) / "z_1",
-        }
-        self.instance_roots = {
-            "img": Path(instance_data_root) / "img",
-            "prompt": Path(instance_data_root) / "prompt",
-            "z_1": Path(instance_data_root) / "z_1",
-            "z_0": Path(instance_data_root) / "z_0",
-        }
+        self.img_root = Path(reflow_data_dir) / "img"
+        self.prompt_root = Path(reflow_data_dir) / "prompt"
+        self.prior_latent_root = Path(reflow_data_dir) / "z_0"
+        self.img_latent_root = Path(reflow_data_dir) / "z_1"
 
-        self.prior_paths = self._get_data_paths(self.prior_roots)
-        self.instance_paths = self._get_data_paths(self.instance_roots)
-        self._length = max(len(self.prior_paths), len(self.instance_paths))
-        
+        self.img_paths = sorted(self.img_root.glob('*.png'))
+        self.prompt_paths = sorted(self.prompt_root.glob('*.pt'))
+        self.prior_latent_paths = sorted(self.prior_latent_root.glob('*.pt'))
+        self.img_latent_paths = sorted(self.img_latent_root.glob('*.pt'))
+
         self.img_transform = transforms.Compose([
             transforms.ToTensor(),
             transforms.Normalize([0.5], [0.5]),
         ])
 
-        print(f"Loaded {len(self.prior_paths)} class prior pairs.")
-        print(f"Loaded {len(self.instance_paths)} instance pairs.")
+        assert len(self.img_paths) == len(self.prompt_paths) == len(self.prior_latent_paths) == len(self.img_latent_paths), \
+            "Number of images, prompts, z0 and z1 should be the same."
 
-    def _get_data_paths(self, roots):
-        files_dict = {}
-        
-        for key in roots:
-            folder = roots[key]
-            if key == "img":
-                pattern = f"{key}_*.png"
-            else:
-                pattern = f"{key}_*.pt"
-            file_paths = sorted(folder.glob(pattern))
-            print(f"Found {len(file_paths)} files for key '{key}', pattern '{pattern}'")
-            files_dict[key] = {}
-            for path in file_paths: 
-                # Extract ID in filename, e.g. 'img_00001.png' -> '00001'
-                filename = path.name
-                match = re.match(rf"{key}_(\d+)\.\w+", filename)
-                if match:
-                    file_id = match.group(1) # str ID
-                    files_dict[key][file_id] = path
-                else:
-                    print(f"Warning: Filename {filename} does not match pattern for key '{key}'")
-                
-        common_ids = set.intersection(*(set(files_dict[key].keys()) for key in files_dict))
-        print(f"Found {len(common_ids)} common IDs in {roots}")
-        
-        data_list = []
-        for file_id in sorted(common_ids):
-            data_item = {}
-            for key in roots:
-                data_item[key] = files_dict[key][file_id]
-            data_list.append(data_item)
-        
-        return data_list
-    
-    def _load_data(self, data_item):
-        data = {}  
-        # NOTE: 把数据增强放在预处理 script 里面
-        img = Image.open(data_item["img"])
-        img = exif_transpose(img)
-        if not img.mode == "RGB": img = img.convert("RGB")
-        data[f"img"] = self.img_transform(img)
+        print(f"Loaded {len(self)} reflow pairs.")
 
-        # Load prompt
-        prompt_data = torch.load(data_item["prompt"], map_location="cpu")
-        data["prompt"] = prompt_data["prompt"]
-        data["prompt_embeds"] = prompt_data["prompt_embeds"].squeeze(0)
-        data["pooled_prompt_embeds"] = prompt_data["pooled_prompt_embeds"].squeeze(0)
-
-        # Load latent
-        data["latent"] = torch.load(data_item["z_1"], map_location="cpu").squeeze(0)
-
-        # Load gaussian
-        if "z_0" in data_item:
-            data["gaussian"] = torch.load(data_item["z_0"], map_location="cpu").squeeze(0)
-
-        return data
-    
-    def __getitem__(self, index):
-        example = {}
-
-        prior_index = index % len(self.prior_paths)
-        prior_data_item = self.prior_paths[prior_index]
-        prior_data = self._load_data(prior_data_item)
-        for key in prior_data:
-            example[f"prior_{key}"] = prior_data[key]
-         
-        instance_index = index % len(self.instance_paths)
-        instance_data_item = self.instance_paths[instance_index]
-        instance_data = self._load_data(instance_data_item)
-        for key in instance_data:
-            example[f"instance_{key}"] = instance_data[key]
-
-        return example
-    
     def __len__(self):
-        return self._length
+        return len(self.img_paths)
 
-class DreamBoosterDataset_v2(Dataset):
-    """
-    Static class prior data
-    Dynamic instance z_0 
-    """
-    def __init__(
-        self,
-        prior_reflow_data_root,
-        instance_data_root,
-    ):
-        self.prior_roots = {
-            "img": Path(prior_reflow_data_root) / "img",
-            "prompt": Path(prior_reflow_data_root) / "prompt",
-            "z_0": Path(prior_reflow_data_root) / "z_0",
-            "z_1": Path(prior_reflow_data_root) / "z_1",
-        }
-        self.instance_roots = {
-            "img": Path(instance_data_root) / "img",
-            "prompt": Path(instance_data_root) / "prompt",
-            "z_1": Path(instance_data_root) / "z_1",
+    def __getitem__(self, index):
+        # Load image
+        img_path = self.img_paths[index]
+        image = Image.open(img_path)
+        image = exif_transpose(image)
+        if not image.mode == "RGB": image = image.convert("RGB")
+        image = self.img_transform(image)
+
+        # Load prompt & embeddings
+        prompt_path = self.prompt_paths[index]
+        prompt_data = torch.load(prompt_path, map_location=torch.device("cpu"))
+        prompt = prompt_data["prompt"]
+        prompt_embed = prompt_data["prompt_embeds"].squeeze(0)
+        pooled_prompt_embed = prompt_data["pooled_prompt_embeds"].squeeze(0)
+
+        # Load reflow pairs
+        prior_latent_path = self.prior_latent_paths[index]
+        img_latent_path = self.img_latent_paths[index]
+        prior_latent = torch.load(prior_latent_path, map_location=torch.device("cpu")).squeeze(0)
+        img_latent = torch.load(img_latent_path, map_location=torch.device("cpu")).squeeze(0)
+
+        return {
+            "image": image,
+            "prompt": prompt,
+            "prompt_embeds": prompt_embed,
+            "pooled_prompt_embeds": pooled_prompt_embed,
+            "gaussian": prior_latent,  # prior latents in VAE space
+            "latent": img_latent,      # img latents in VAE space
         }
 
-        self.prior_paths = self._get_data_paths(self.prior_roots)
-        self.instance_paths = self._get_data_paths(self.instance_roots)
-        self.instance_z0_cache = {instance_data_item["id"]: None for instance_data_item in self.instance_paths} # initialize z_0 cache to None
-        print(self.instance_z0_cache)
-        self._length = max(len(self.prior_paths), len(self.instance_paths))
-        
-        self.img_transform = transforms.Compose([
-            transforms.ToTensor(),
-            transforms.Normalize([0.5], [0.5]),
-        ])
-
-        print(f"Loaded {len(self.prior_paths)} class prior pairs.")
-        print(f"Loaded {len(self.instance_paths)} instance pairs.")
-
-    def update_z0_cache(self, backward_reflow_func):
-        for instance_path in self.instance_paths:
-            instance_data = self._load_data(instance_path)
-            print(f"Updating z_0 cache for instance {instance_path['id']}")
-            z_0 = backward_reflow_func(  # backward reflow (add noise)
-                instance_data["prompt_embeds"].unsqueeze(0),
-                instance_data["pooled_prompt_embeds"].unsqueeze(0),
-                instance_data["latent"].unsqueeze(0),
-            )
-            self.instance_z0_cache[instance_path["id"]] = z_0
-            torch.save(z_0.detach(), f"./{instance_path['id']}_z_0.pt")
-
-    def _get_data_paths(self, roots):
-        files_dict = {}
-        
-        for key in roots:
-            folder = roots[key]
-            if key == "img":
-                pattern = f"{key}_*.png"
-            else:
-                pattern = f"{key}_*.pt"
-            file_paths = sorted(folder.glob(pattern))
-            print(f"Found {len(file_paths)} files for key '{key}', pattern '{pattern}'")
-            files_dict[key] = {}
-            for path in file_paths: 
-                # Extract ID in filename, e.g. 'img_00001.png' -> '00001'
-                filename = path.name
-                match = re.match(rf"{key}_(\d+)\.\w+", filename)
-                if match:
-                    file_id = match.group(1) # str ID
-                    files_dict[key][file_id] = path
-                else:
-                    print(f"Warning: Filename {filename} does not match pattern for key '{key}'")
-                
-        common_ids = set.intersection(*(set(files_dict[key].keys()) for key in files_dict))
-        print(f"Found {len(common_ids)} common IDs in {roots}")
-        
-        data_roots = [] # a dict list, each dict contains the paths of a data item, e.g. {'id': ..., 'img': ..., 'prompt': ..., 'z_0': ..., 'z_1': ...}
-        for file_id in sorted(common_ids):
-            data_item = {'id': file_id}
-            for key in roots:
-                data_item[key] = files_dict[key][file_id]
-            data_roots.append(data_item)
-        
-        return data_roots
-    
-    def _load_data(self, data_path):
-        data = {"id": data_path["id"]}  
-
-        img = Image.open(data_path["img"]) # NOTE: 把数据增强放在预处理 script 里面
-        img = exif_transpose(img)
-        if not img.mode == "RGB": img = img.convert("RGB")
-        data["img"] = self.img_transform(img)
-
-        # Load prompt
-        prompt_data = torch.load(data_path["prompt"], map_location="cpu")
-        data["prompt"] = prompt_data["prompt"]
-        data["prompt_embeds"] = prompt_data["prompt_embeds"].squeeze(0)
-        data["pooled_prompt_embeds"] = prompt_data["pooled_prompt_embeds"].squeeze(0)
-
-        # Load image latent
-        data["latent"] = torch.load(data_path["z_1"], map_location="cpu").squeeze(0)
-
-        # Load gaussian
-        if "z_0" in data_path: # class prior data's z_0 is fixed 
-            data["gaussian"] = torch.load(data_path["z_0"], map_location="cpu").squeeze(0)
-        else: # instance data's z_0 is dynamic  (initialized to None)
-            data["gaussian"] = self.instance_z0_cache[data_path["id"]]
-
-        return data
-    
-    def __getitem__(self, index):
-        example = {}
-
-        prior_index = index % len(self.prior_paths)
-        prior_data_path = self.prior_paths[prior_index]
-        prior_data = self._load_data(prior_data_path)
-        for key in prior_data:
-            example[f"prior_{key}"] = prior_data[key]
-
-        instance_index = index % len(self.instance_paths)
-        instance_data_path = self.instance_paths[instance_index]
-        instance_data = self._load_data(instance_data_path)
-        for key in instance_data:
-            example[f"instance_{key}"] = instance_data[key]
-
-        return example
-    
-    def __len__(self):
-        return self._length
-    
 def collate_fn(examples):
     batch = {}
     keys = examples[0].keys()
@@ -951,7 +720,6 @@ def encode_prompt(
     text_input_ids_list=None,
 ):
     prompt = [prompt] if isinstance(prompt, str) else prompt
-    batch_size = len(prompt)
     dtype = text_encoders[0].dtype
 
     pooled_prompt_embeds = _encode_prompt_with_clip(
@@ -973,72 +741,9 @@ def encode_prompt(
         text_input_ids=text_input_ids_list[1] if text_input_ids_list else None,
     )
 
-    text_ids = torch.zeros(batch_size, prompt_embeds.shape[1], 3).to(device=device, dtype=dtype)
-    text_ids = text_ids.repeat(num_images_per_prompt, 1, 1)
+    text_ids = torch.zeros(prompt_embeds.shape[1], 3).to(device=device, dtype=dtype)
 
     return prompt_embeds, pooled_prompt_embeds, text_ids
-
-@torch.inference_mode()
-def reverse_denoise(
-        prompt_embeds, 
-        pooled_prompt_embeds, 
-        latents, 
-        guidance_scale, 
-        transformer, 
-        weight_dtype,
-    ):
-    print(f"prompt_embeds.shape: {prompt_embeds.shape}")
-    print(f"pooled_prompt_embeds.shape: {pooled_prompt_embeds.shape}")
-    print(f"latents.shape: {latents.shape}")
-    prompt_embeds = prompt_embeds.to(weight_dtype).to(transformer.device)
-    pooled_prompt_embeds = pooled_prompt_embeds.to(weight_dtype).to(transformer.device)
-    latents = latents.to(weight_dtype).to(transformer.device)
-    text_ids = torch.zeros(prompt_embeds.shape[0], prompt_embeds.shape[1], 3,
-                device=prompt_embeds.device, dtype=weight_dtype)
-    latent_image_ids = FluxPipeline._prepare_latent_image_ids(
-        latents.shape[0],
-        latents.shape[2],
-        latents.shape[3],
-        latents.device,
-        weight_dtype,
-    )
-    packed_latents = FluxPipeline._pack_latents( # shape [num_samples, (resolution // 16 * resolution // 16), 16 * 2 * 2]
-        latents,
-        batch_size=latents.shape[0],
-        num_channels_latents=latents.shape[1],
-        height=latents.shape[2],
-        width=latents.shape[3],
-    )
-    timesteps = torch.linspace(1, 0, args.num_inversion_steps + 1)
-    timesteps = list(reversed(timesteps))
-    for t_curr, t_prev in zip(timesteps[:-1], timesteps[1:]):
-        t_vec = torch.full((packed_latents.shape[0],), t_curr, dtype=packed_latents.dtype, device=packed_latents.device)
-        guidance_vec = torch.full((packed_latents.shape[0],), guidance_scale, device=packed_latents.device, dtype=packed_latents.dtype)
-        print(f"X_{t_prev:.4f} = X_{t_curr:.4f} + h * F(X_{t_curr:.4f})")
-        pred = transformer(
-                hidden_states=packed_latents, # shape: [batch_size, seq_len, num_channels_latents], e.g. [1, 4096, 64] for 1024x1024
-                timestep=t_vec,               # range: [0, 1]
-                guidance=guidance_vec,        # scalar guidance values for each sample in the batch
-                pooled_projections=pooled_prompt_embeds, # CLIP text embedding
-                encoder_hidden_states=prompt_embeds,     # T5 text embedding
-                txt_ids=text_ids,
-                img_ids=latent_image_ids,
-                joint_attention_kwargs=None,
-                return_dict=False,
-            )[0]
-        packed_latents = packed_latents.to(torch.float32)
-        pred = pred.to(torch.float32)
-        packed_latents = packed_latents + (t_prev - t_curr) * pred
-        packed_latents = packed_latents.to(weight_dtype)
-
-    latents = FluxPipeline._unpack_latents(
-                    packed_latents, # BUG!!!!!!!
-                    height=int(latents.shape[2] * 16 / 2),
-                    width=int(latents.shape[3] * 16 / 2),
-                    vae_scale_factor=16,
-                )
-    latents = latents.squeeze(0).to("cpu")
-    return latents
 
 
 def main(args):
@@ -1121,11 +826,6 @@ def main(args):
         args.pretrained_model_name_or_path, subfolder="text_encoder_2"
     )
 
-    # Load scheduler and models
-    noise_scheduler = FlowMatchEulerDiscreteScheduler.from_pretrained(
-        args.pretrained_model_name_or_path, subfolder="scheduler"
-    )
-    noise_scheduler_copy = copy.deepcopy(noise_scheduler)
     text_encoder_one, text_encoder_two = load_text_encoders(text_encoder_cls_one, text_encoder_cls_two)
     vae = AutoencoderKL.from_pretrained(
         args.pretrained_model_name_or_path,
@@ -1136,8 +836,8 @@ def main(args):
         args.pretrained_model_name_or_path, subfolder="transformer", variant=args.variant
     )
 
-    # We only train the additional adapter LoRA layers
-    transformer.requires_grad_(False)
+    # We only train the FluxTransformer2DModel
+    transformer.requires_grad_(True)
     vae.requires_grad_(False)
     text_encoder_one.requires_grad_(False)
     text_encoder_two.requires_grad_(False)
@@ -1156,65 +856,13 @@ def main(args):
             "Mixed precision training with bfloat16 is not supported on MPS. Please use fp16 (recommended) or fp32 instead."
         )
 
-    vae.to(accelerator.device, dtype=weight_dtype)
     transformer.to(accelerator.device, dtype=weight_dtype)
+    vae.to(accelerator.device, dtype=weight_dtype)
     text_encoder_one.to(accelerator.device, dtype=weight_dtype)
     text_encoder_two.to(accelerator.device, dtype=weight_dtype)
 
     if args.gradient_checkpointing:
         transformer.enable_gradient_checkpointing()
-
-    # now we will add new LoRA weights to the attention layers
-    transformer_lora_config = LoraConfig(
-        r=args.rank,
-        lora_alpha=args.rank,
-        init_lora_weights="gaussian",
-        target_modules=["to_k", 
-                        "to_q", 
-                        "to_v", 
-                        "to_out.0",
-                        "add_k_proj",
-                        "add_q_proj",
-                        "add_v_proj",
-                        "to_add_out",
-                        "norm.linear",
-                        "proj_mlp",
-                        "proj_out",
-                        "ff.net.0.proj",
-                        "ff.net.2",
-                        "ff_context.net.0.proj",
-                        "ff_context.net.2",
-                        "norm1.linear",
-                        "norm1_context.linear",
-                        "norm.linear",
-                        "timestep_embedder.linear_1",
-                        "timestep_embedder.linear_2",
-                        "guidance_embedder.linear_1",
-                        "guidance_embedder.linear_2",
-                        ],
-    )
-    transformer.add_adapter(transformer_lora_config)
-
-    # Load pretrained LoRA weights
-    def load_pretrained_rf(transformer, ckpt_path):
-        lora_state_dict = FluxPipeline.lora_state_dict(ckpt_path)
-        transformer_state_dict = {
-            f'{k.replace("transformer.", "")}': v for k, v in lora_state_dict.items() if k.startswith("transformer.")
-        }
-        transformer_state_dict = convert_unet_state_dict_to_peft(transformer_state_dict)
-        incompatible_keys = set_peft_model_state_dict(transformer, transformer_state_dict, adapter_name="default")
-        if incompatible_keys is not None:
-            # check only for unexpected keys
-            unexpected_keys = getattr(incompatible_keys, "unexpected_keys", None)
-            if unexpected_keys:
-                print(
-                    f"Loading loaded pretrained (k-1) rf from {ckpt_path} led to unexpected keys not found in the model: "
-                    f" {unexpected_keys}. "
-                )
-            else: 
-                print("Successfully loaded pretrained (k-1) rf")
-    if args.pretrained_lora_path is not None:
-        load_pretrained_rf(transformer, args.rf_lora_ckpt_path)
 
     def unwrap_model(model):
         model = accelerator.unwrap_model(model)
@@ -1224,63 +872,49 @@ def main(args):
     # create custom saving & loading hooks so that `accelerator.save_state(...)` serializes in a nice format
     def save_model_hook(models, weights, output_dir):
         if accelerator.is_main_process:
-            transformer_lora_layers_to_save = None
-            text_encoder_one_lora_layers_to_save = None
-
-            for model in models:
-                if isinstance(model, type(unwrap_model(transformer))):
-                    transformer_lora_layers_to_save = get_peft_model_state_dict(model)
-                elif isinstance(model, type(unwrap_model(text_encoder_one))):
-                    text_encoder_one_lora_layers_to_save = get_peft_model_state_dict(model)
+            for i, model in enumerate(models):
+                if isinstance(unwrap_model(model), FluxTransformer2DModel):
+                    unwrap_model(model).save_pretrained(os.path.join(output_dir, "transformer"))
+                elif isinstance(unwrap_model(model), (CLIPTextModelWithProjection, T5EncoderModel)): # Maybe not to save T5EncoderModel
+                    if isinstance(unwrap_model(model), CLIPTextModelWithProjection):
+                        # unwrap_model(model).save_pretrained(os.path.join(output_dir, "text_encoder"))
+                        print("Skipping saving text_encoder_1, CLIPTextModelWithProjection")
+                    else:
+                        # unwrap_model(model).save_pretrained(os.path.join(output_dir, "text_encoder_2"))
+                        print("Skipping saving text_encoder_2, T5EncoderModel")
                 else:
-                    raise ValueError(f"unexpected save model: {model.__class__}")
+                    raise ValueError(f"Wrong model supplied: {type(model)=}.")
 
                 # make sure to pop weight so that corresponding model is not saved again
                 weights.pop()
 
-            FluxPipeline.save_lora_weights(
-                output_dir,
-                transformer_lora_layers=transformer_lora_layers_to_save,
-                text_encoder_lora_layers=text_encoder_one_lora_layers_to_save,
-            )
-
     def load_model_hook(models, input_dir):
-        transformer_ = None
-        text_encoder_one_ = None
-
-        while len(models) > 0:
+        for _ in range(len(models)):
+            # pop models so that they are not loaded again
             model = models.pop()
 
-            if isinstance(model, type(unwrap_model(transformer))):
-                transformer_ = model
-            elif isinstance(model, type(unwrap_model(text_encoder_one))):
-                text_encoder_one_ = model
+            # load diffusers style into model
+            if isinstance(unwrap_model(model), FluxTransformer2DModel):
+                load_model = FluxTransformer2DModel.from_pretrained(input_dir, subfolder="transformer")
+                model.register_to_config(**load_model.config)
+
+                model.load_state_dict(load_model.state_dict())
+            elif isinstance(unwrap_model(model), (CLIPTextModelWithProjection, T5EncoderModel)):
+                try:
+                    load_model = CLIPTextModelWithProjection.from_pretrained(input_dir, subfolder="text_encoder")
+                    model(**load_model.config)
+                    model.load_state_dict(load_model.state_dict())
+                except Exception:
+                    try:
+                        load_model = T5EncoderModel.from_pretrained(input_dir, subfolder="text_encoder_2")
+                        model(**load_model.config)
+                        model.load_state_dict(load_model.state_dict())
+                    except Exception:
+                        raise ValueError(f"Couldn't load the model of type: ({type(model)}).")
             else:
-                raise ValueError(f"unexpected save model: {model.__class__}")
+                raise ValueError(f"Unsupported model found: {type(model)=}")
 
-        lora_state_dict = FluxPipeline.lora_state_dict(input_dir)
-
-        transformer_state_dict = {
-            f'{k.replace("transformer.", "")}': v for k, v in lora_state_dict.items() if k.startswith("transformer.")
-        }
-        transformer_state_dict = convert_unet_state_dict_to_peft(transformer_state_dict)
-        incompatible_keys = set_peft_model_state_dict(transformer_, transformer_state_dict, adapter_name="default")
-        if incompatible_keys is not None:
-            # check only for unexpected keys
-            unexpected_keys = getattr(incompatible_keys, "unexpected_keys", None)
-            if unexpected_keys:
-                logger.warning(
-                    f"Loading adapter weights from state_dict led to unexpected keys not found in the model: "
-                    f" {unexpected_keys}. "
-                )
-
-        # Make sure the trainable params are in float32. This is again needed since the base models
-        # are in `weight_dtype`. More details:
-        # https://github.com/huggingface/diffusers/pull/6514#discussion_r1449796804
-        if args.mixed_precision == "fp16":
-            models = [transformer_]
-            # only upcast trainable parameters (LoRA) into fp32
-            cast_training_params(models)
+            del load_model
 
     accelerator.register_save_state_pre_hook(save_model_hook)
     accelerator.register_load_state_pre_hook(load_model_hook)
@@ -1295,24 +929,14 @@ def main(args):
             args.learning_rate * args.gradient_accumulation_steps * args.train_batch_size * accelerator.num_processes
         )
 
-    # Make sure the trainable params are in float32.
-    if args.mixed_precision == "fp16":
-        models = [transformer]
-        # only upcast trainable parameters (LoRA) into fp32
-        cast_training_params(models, dtype=torch.float32)
-
-    transformer_lora_parameters = list(filter(lambda p: p.requires_grad, transformer.parameters()))
-    num_trainable_params = sum(p.numel() for p in transformer_lora_parameters)
-    print(f"Number of trainable parameters in transformer LoRA: {num_trainable_params}")
-
     # Optimization parameters
-    transformer_parameters_with_lr = {"params": transformer_lora_parameters, "lr": args.learning_rate}
+    transformer_parameters_with_lr = {"params": transformer.parameters(), "lr": args.learning_rate}
     params_to_optimize = [transformer_parameters_with_lr]
 
     # Optimizer creation
-    if not (args.optimizer.lower() == "prodigy" or args.optimizer.lower() == "adamw"):
+    if not (args.optimizer.lower() == "prodigy" or args.optimizer.lower() == "adamw" or args.optimizer.lower() == "adafactor"):
         logger.warning(
-            f"Unsupported choice of optimizer: {args.optimizer}.Supported optimizers include [adamW, prodigy]."
+            f"Unsupported choice of optimizer: {args.optimizer}.Supported optimizers include [adamW, prodigy, adafactor]."
             "Defaulting to adamW"
         )
         args.optimizer = "adamw"
@@ -1368,6 +992,23 @@ def main(args):
             safeguard_warmup=args.prodigy_safeguard_warmup,
         )
 
+    if args.optimizer.lower() == "adafactor":
+        try:
+            from transformers.optimization import Adafactor
+        except ImportError:
+            raise ImportError("To use Adafactor, please install the transformers library: `pip install transformers`")
+        
+        optimizer_class = Adafactor
+
+        optimizer = optimizer_class(
+            params_to_optimize,
+            lr=args.learning_rate,
+            scale_parameter=False,
+            relative_step=False,
+            warmup_init=False,
+            weight_decay=0.01,
+        )
+
     tokenizers = [tokenizer_one, tokenizer_two]
     text_encoders = [text_encoder_one, text_encoder_two]
 
@@ -1382,9 +1023,8 @@ def main(args):
         return prompt_embeds, pooled_prompt_embeds, text_ids
     
     # Dataset and DataLoaders creation:
-    train_dataset = DreamBoosterDataset_v2(
-        prior_reflow_data_root=args.prior_reflow_data_root,
-        instance_data_root=args.instance_data_root,
+    train_dataset = ReflowDataset(
+        reflow_data_dir=args.reflow_data_root,
     )
 
     train_dataloader = torch.utils.data.DataLoader(
@@ -1441,7 +1081,7 @@ def main(args):
     # We need to initialize the trackers we use, and also store our configuration.
     # The trackers initializes automatically on the main process.
     if accelerator.is_main_process:
-        tracker_name = "flux-dreamreflow-lora"
+        tracker_name = "flux-reflow-full-finetune"
         accelerator.init_trackers(tracker_name, config=vars(args))
 
     # Train!
@@ -1554,44 +1194,30 @@ def main(args):
         transformer.train()
 
         for step, batch in enumerate(train_dataloader):
-            # for key in batch:
-            #     print("batch has", key, " type", type(batch[key]))
             models_to_accumulate = [transformer]
+
+        #     return {
+        #     "image": image,
+        #     "prompt": prompt,
+        #     "prompt_embeds": prompt_embed,
+        #     "pooled_prompt_embeds": pooled_prompt_embed,
+        #     "gaussian": prior_latent,  # prior latents in VAE space
+        #     "latent": img_latent,      # img latents in VAE space
+        # }
+
             with accelerator.accumulate(models_to_accumulate):
-                if step % 2 == 0: # prior loss
-                    prompt_embeds = batch["prior_prompt_embeds"].to(dtype=weight_dtype)
-                    pooled_prompt_embeds = batch["prior_pooled_prompt_embeds"].to(dtype=weight_dtype)
-                    latent = batch["prior_latent"].to(dtype=weight_dtype)
-                    if args.use_reflow_prior_loss: # reflow z_0
-                        gaussian = batch["prior_gaussian"].to(dtype=weight_dtype) 
-                        t_dist = "u_shape"
-                    else: # dreambooth baseline
-                        gaussian = torch.randn_like(latent) 
-                        t_dist = "uniform"
-                    loss_scale = args.prior_loss_weight
-                    print("prior reflow:", args.use_reflow_prior_loss, "prior data id", batch["prior_id"])
-                    # print("prior_latent", latent.shape, "prior_gaussian", gaussian.shape)
-                else: # instance loss
-                    prompt_embeds = batch["instance_prompt_embeds"].to(dtype=weight_dtype)
-                    pooled_prompt_embeds = batch["instance_pooled_prompt_embeds"].to(dtype=weight_dtype)
-                    latent = batch["instance_latent"].to(dtype=weight_dtype)
-                    if any(item is None for item in batch["instance_gaussian"]) or not args.use_dynamic_instance_reflow: # use random z_0
-                        gaussian = torch.randn_like(latent)
-                        t_dist = "uniform"
-                        loss_scale = 1.0
-                        print("Instance z_0: gaussian, not reversed")
-                    else: # use reflow prior loss & z_0 is already computed
-                        gaussian = batch["instance_gaussian"].to(dtype=weight_dtype)
-                        t_dist = "u_shape"
-                        loss_scale = args.prior_loss_weight
-                        print("Instance z_0: reversed")
-                    print("instance data id", batch["instance_id"])
-                    # print("instance_latent", latent.shape, "instance_gaussian", gaussian.shape)
+                prompt = batch["prompt"]
+                prompt_embeds = batch["prompt_embeds"].to(dtype=weight_dtype)
+                pooled_prompt_embeds = batch["pooled_prompt_embeds"].to(dtype=weight_dtype)
+                latent = batch["latent"].to(dtype=weight_dtype)
+                gaussian = batch["gaussian"].to(dtype=weight_dtype) 
+                t_dist = args.training_t_dist
 
                 t = sample_training_timesteps(
                     t_dist, latent.shape[0], (latent.shape[2]//2) * (latent.shape[3]//2)
                     ).to(dtype=weight_dtype, device=latent.device)
-                print("train at t:", t, "t_dist:", t_dist)
+                
+                print("train at t:", t, "t_dist:", t_dist, "prompt:", prompt)
 
                 latent_image_ids = FluxPipeline._prepare_latent_image_ids(
                         latent.shape[0],
@@ -1601,8 +1227,7 @@ def main(args):
                         weight_dtype,
                     )
 
-                text_ids = torch.zeros(prompt_embeds.shape[0], prompt_embeds.shape[1], 3,
-                                    device=prompt_embeds.device, dtype=weight_dtype)
+                text_ids = torch.zeros(prompt_embeds.shape[1], 3).to(device=prompt_embeds.device, dtype=weight_dtype)
                     
                 noisy_latent = (1. - t[:, None, None, None]) * latent + t[:, None, None, None] * gaussian
 
@@ -1648,8 +1273,7 @@ def main(args):
                 target = gaussian - latent
                 # Compute prior or instance loss
                 loss = torch.mean((model_pred.float() - target.float()) ** 2)
-                loss = loss_scale * loss
-                print(f"loss scale: {loss_scale}, loss: {loss}")
+                print(f"loss: {loss}")
 
                 accelerator.backward(loss)
                 if accelerator.sync_gradients:
@@ -1690,17 +1314,6 @@ def main(args):
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
-                
-                if args.use_dynamic_instance_reflow and args.global_step % args.backward_update_steps == 0 and global_step >= args.backward_reflow_threshold:
-                    reverse_denoise_wrapper = lambda prompt_embeds, pooled_prompt_embeds, latents: reverse_denoise(
-                        prompt_embeds,
-                        pooled_prompt_embeds,
-                        latents,
-                        guidance_scale=3.5,
-                        transformer=transformer,
-                        weight_dtype=weight_dtype,
-                    )
-                    train_dataset.update_z0_cache(reverse_denoise_wrapper)
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
@@ -1735,31 +1348,22 @@ def main(args):
                 torch.cuda.empty_cache()
                 gc.collect()
 
-    # Save the lora layers
+    # Save the final model
     accelerator.wait_for_everyone()
     if accelerator.is_main_process:
         transformer = unwrap_model(transformer)
         transformer = transformer.to(torch.float32)
-        transformer_lora_layers = get_peft_model_state_dict(transformer)
-
-        text_encoder_lora_layers = None
-
-        FluxPipeline.save_lora_weights(
-            save_directory=args.output_dir,
-            transformer_lora_layers=transformer_lora_layers,
-            text_encoder_lora_layers=text_encoder_lora_layers,
-        )
+        
+        pipeline = FluxPipeline.from_pretrained(args.pretrained_model_name_or_path, transformer=transformer)
+        pipeline.save_pretrained(args.output_dir)
 
         # Final inference
         # Load previous pipeline
         pipeline = FluxPipeline.from_pretrained(
-            args.pretrained_model_name_or_path,
+            args.output_dir,
             variant=args.variant,
             torch_dtype=weight_dtype,
         )
-        # load attention processors
-        pipeline.load_lora_weights(args.output_dir)
-
         # run inference
         images = []
         if args.validation_prompt and args.num_validation_images > 0:

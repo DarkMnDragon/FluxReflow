@@ -258,11 +258,6 @@ def parse_args(input_args=None):
         help="Whether to use the reflow prior loss.",
     )
     parser.add_argument(
-        "--use_dynamic_instance_reflow",
-        action="store_true",
-        help="Whether to use dynamic instance reflow.",
-    )
-    parser.add_argument(
         "--backward_reflow_threshold",
         type=int,
         default=1000,
@@ -1564,10 +1559,10 @@ def main(args):
                     latent = batch["prior_latent"].to(dtype=weight_dtype)
                     if args.use_reflow_prior_loss: # reflow z_0
                         gaussian = batch["prior_gaussian"].to(dtype=weight_dtype) 
-                        t_dist = "u_shape"
+                        t_dist = "flux_shift"
                     else: # dreambooth baseline
                         gaussian = torch.randn_like(latent) 
-                        t_dist = "uniform"
+                        t_dist = "logit_normal"
                     loss_scale = args.prior_loss_weight
                     print("prior reflow:", args.use_reflow_prior_loss, "prior data id", batch["prior_id"])
                     # print("prior_latent", latent.shape, "prior_gaussian", gaussian.shape)
@@ -1575,14 +1570,14 @@ def main(args):
                     prompt_embeds = batch["instance_prompt_embeds"].to(dtype=weight_dtype)
                     pooled_prompt_embeds = batch["instance_pooled_prompt_embeds"].to(dtype=weight_dtype)
                     latent = batch["instance_latent"].to(dtype=weight_dtype)
-                    if any(item is None for item in batch["instance_gaussian"]) or not args.use_dynamic_instance_reflow: # use random z_0
+                    if any(item is None for item in batch["instance_gaussian"]) or not args.use_reflow_prior_loss: # use random z_0
                         gaussian = torch.randn_like(latent)
-                        t_dist = "uniform"
+                        t_dist = "logit_normal"
                         loss_scale = 1.0
                         print("Instance z_0: gaussian, not reversed")
                     else: # use reflow prior loss & z_0 is already computed
                         gaussian = batch["instance_gaussian"].to(dtype=weight_dtype)
-                        t_dist = "u_shape"
+                        t_dist = "flux_shift"
                         loss_scale = args.prior_loss_weight
                         print("Instance z_0: reversed")
                     print("instance data id", batch["instance_id"])
@@ -1691,7 +1686,7 @@ def main(args):
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
                 
-                if args.use_dynamic_instance_reflow and args.global_step % args.backward_update_steps == 0 and global_step >= args.backward_reflow_threshold:
+                if global_step % args.backward_update_steps == 0 and global_step >= args.backward_reflow_threshold:
                     reverse_denoise_wrapper = lambda prompt_embeds, pooled_prompt_embeds, latents: reverse_denoise(
                         prompt_embeds,
                         pooled_prompt_embeds,
