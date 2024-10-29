@@ -3,14 +3,14 @@ import random
 
 # https://journeydb.github.io
 
-def extract_prompts(file_path):
-    prompts = []
+def extract_captions(file_path):
+    captions = []
     with open(file_path, 'r', encoding='utf-8') as f:
         for line in f:
-            data = json.loads(line)
-            if 'prompt' in data:
-                prompts.append(data['prompt'])
-    return prompts
+            data = json.loads(line) # NOTE: Use caption instead of original prompt
+            if 'Task2' in data and 'Caption' in data['Task2']:
+                captions.append(data['Task2']['Caption'])
+    return captions
 
 def filter_prompts_by_length(prompts, min_words=10):
     """filter out prompts with less than or equal to the specified number of words."""
@@ -27,7 +27,7 @@ def save_prompts_to_txt(prompts, output_file):
 file_path = '/Users/darkmoonbook/Downloads/train_anno_realease_repath.jsonl'
 output_file = 'sampled_prompts.txt'
 
-prompts = extract_prompts(file_path)
+prompts = extract_captions(file_path)
 
 prompts = filter_prompts_by_length(prompts, min_words=10)
 
