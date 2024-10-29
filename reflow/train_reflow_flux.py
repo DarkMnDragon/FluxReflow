@@ -54,9 +54,9 @@ from diffusers import (
 from diffusers.optimization import get_scheduler
 from diffusers.utils import (
     check_min_version,
-    convert_unet_state_dict_to_peft,
     is_wandb_available,
 )
+from diffusers.training_utils import EMAModel
 from diffusers.utils.hub_utils import load_or_create_model_card, populate_model_card
 from diffusers.utils.torch_utils import is_compiled_module
 
@@ -359,7 +359,11 @@ def parse_args(input_args=None):
         default=1e-4,
         help="Initial learning rate (after the potential warmup period) to use.",
     )
-
+    parser.add_argument(
+        "--use_ema",
+        action="store_true",
+        help="Whether or not to use an exponential moving average of the model weights.",
+    )
     parser.add_argument(
         "--guidance_scale",
         type=float,
@@ -864,6 +868,17 @@ def main(args):
     if args.gradient_checkpointing:
         transformer.enable_gradient_checkpointing()
 
+    if args.use_ema:
+        if args.resume_from_checkpoint:
+            ema_transformer = FluxTransformer2DModel.from_pretrained(os.path.join(args.resume_from_checkpoint, "transformer_ema"))
+        else: 
+            ema_transformer = FluxTransformer2DModel.from_pretrained(
+                args.pretrained_model_name_or_path, subfolder="transformer", variant=args.variant
+            )
+        ema_transformer.requires_grad_(False)
+        ema_transformer = EMAModel(ema_transformer.parameters(), model_cls=FluxTransformer2DModel, model_config=transformer.config, decay=0.9992)
+        ema_transformer.to(accelerator.device, dtype=weight_dtype)
+
     def unwrap_model(model):
         model = accelerator.unwrap_model(model)
         model = model._orig_mod if is_compiled_module(model) else model
@@ -1122,7 +1137,6 @@ def main(args):
 
             initial_global_step = global_step
             first_epoch = global_step // num_update_steps_per_epoch
-
     else:
         initial_global_step = 0
 
@@ -1161,7 +1175,7 @@ def main(args):
         C = a / (torch.exp(torch.tensor(a)) - 1)
         return C * torch.exp(a * x)
 
-    def u_shaped_t(num_samples, alpha=2.):
+    def u_shaped_t(num_samples, alpha=4.0):
         alpha = torch.tensor(alpha, dtype=torch.float32)
         u = torch.rand(num_samples)
         t = -torch.log(1 - u * (1 - torch.exp(-alpha))) / alpha  # inverse cdf = torch.log(u * (torch.exp(torch.tensor(a)) - 1) / a) / a
@@ -1217,7 +1231,7 @@ def main(args):
                     t_dist, latent.shape[0], (latent.shape[2]//2) * (latent.shape[3]//2)
                     ).to(dtype=weight_dtype, device=latent.device)
                 
-                print("train at t:", t, "t_dist:", t_dist, "prompt:", prompt)
+                print("train at t:", t, "t_dist:", t_dist, )
 
                 latent_image_ids = FluxPipeline._prepare_latent_image_ids(
                         latent.shape[0],
@@ -1314,6 +1328,14 @@ def main(args):
                         save_path = os.path.join(args.output_dir, f"checkpoint-{global_step}")
                         accelerator.save_state(save_path)
                         logger.info(f"Saved state to {save_path}")
+                        if args.use_ema:
+                            # ema_transformer.save_pretrained(os.path.join(save_path, "transformer_ema")) # prevent using this because of it will save the model into fp32
+                            tmp_model = ema_transformer.model_cls.from_config(ema_transformer.model_config)
+                            for param in tmp_model.parameters():
+                                param.data = param.data.to(dtype=weight_dtype)
+                            ema_transformer.copy_to(tmp_model.parameters())
+                            tmp_model.save_pretrained(os.path.join(save_path, "transformer_ema"))
+                            del tmp_model
 
             logs = {"loss": loss.detach().item(), "lr": lr_scheduler.get_last_lr()[0]}
             progress_bar.set_postfix(**logs)
