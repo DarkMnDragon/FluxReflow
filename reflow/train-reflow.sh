@@ -8,11 +8,10 @@ accelerate launch train_reflow_flux.py \
   --training_t_dist="u_shape" \
   --mixed_precision="bf16" \
   --resolution="1024*1024" \
-  --resume_from_checkpoint="/root/autodl-tmp/lora_ckpt/2rf-various-prompts-full-finetune-journeydb-v3-alpha=4.0-ema/checkpoint-2000" \
   --train_batch_size=1 \
   --gradient_accumulation_steps=4 \
   --optimizer="Adafactor" \
-  --learning_rate=2e-5 \
+  --learning_rate=1e-5 \
   --use_ema \
   --adam_weight_decay=0.01 \
   --report_to="wandb" \

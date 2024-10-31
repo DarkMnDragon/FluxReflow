@@ -1302,6 +1302,8 @@ def main(args):
             if accelerator.sync_gradients:
                 progress_bar.update(1)
                 global_step += 1
+                if args.use_ema:
+                    ema_transformer.step(transformer.parameters())
 
                 if accelerator.is_main_process:
                     if global_step % args.checkpointing_steps == 0:
